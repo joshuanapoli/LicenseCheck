@@ -30,6 +30,63 @@ RAW_JOINS = " AND "
 HTTP_OK = 200
 
 
+def _source_path_name(path: object) -> str | None:
+	if not isinstance(path, str):
+		return None
+
+	path_name = Path(path).name
+	return path_name if re.fullmatch(r"(?!-)[A-Za-z0-9_.-]+", path_name) else None
+
+
+def _source_options(source: object) -> list[object]:
+	return list(source) if isinstance(source, list) else [source]
+
+
+def _nested_pyproject(requirements_path: Path, path: object) -> Path | None:
+	if not isinstance(path, str):
+		return None
+
+	source_path = (requirements_path.parent / path).resolve()
+	return source_path if source_path.name == "pyproject.toml" else source_path / "pyproject.toml"
+
+
+def _uv_sources(requirements_path: Path) -> dict[str, object]:
+	try:
+		pyproject = tomli.loads(requirements_path.read_text(encoding="utf-8"))
+	except (OSError, tomli.TOMLDecodeError):
+		return {}
+
+	sources = pyproject.get("tool", {}).get("uv", {}).get("sources", {})
+	return sources if isinstance(sources, dict) else {}
+
+
+def _editable_uv_sources(requirements_path: Path, visited: set[Path] | None = None) -> set[str]:
+	requirements_path = requirements_path.resolve()
+	if visited is None:
+		visited = set()
+	if requirements_path.name != "pyproject.toml" or requirements_path in visited:
+		return set()
+	visited.add(requirements_path)
+
+	editable_sources: set[str] = set()
+
+	for name, source in _uv_sources(requirements_path).items():
+		for source_option in _source_options(source):
+			if not isinstance(source_option, dict):
+				continue
+
+			path = source_option.get("path")
+			if source_option.get("editable"):
+				editable_sources.add(name)
+				if path_name := _source_path_name(path):
+					editable_sources.add(path_name)
+
+			if nested_pyproject := _nested_pyproject(requirements_path, path):
+				editable_sources.update(_editable_uv_sources(nested_pyproject, visited))
+
+	return editable_sources
+
+
 class PackageInfoManager:
 	"""Manages retrieval of local and remote package information."""
 
@@ -51,12 +108,15 @@ class PackageInfoManager:
 		skip_dependencies: set[str],
 	) -> None:
 		for requirements_path in requirements_paths:
+			requirements_path_obj = Path(requirements_path)
+			# DepGather cannot parse the `-e path` lines uv emits for editable sources.
 			self.reqs.update(
 				gather(
-					skipDependencies=skip_dependencies,
+					skipDependencies=skip_dependencies
+					| _editable_uv_sources(requirements_path_obj),
 					groups=groups,
 					extras=extras,
-					requirementsPath=Path(requirements_path),
+					requirementsPath=requirements_path_obj,
 					base_index_url=self.base_pypi_url,
 				)
 			)
