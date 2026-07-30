@@ -5,6 +5,7 @@ from __future__ import annotations
 import configparser
 import contextlib
 import re
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from email.message import Message
 from importlib import metadata
@@ -14,6 +15,7 @@ from typing import Any
 
 import license_expression
 import requests
+import requirements
 import tomli
 from boolean.boolean import Expression
 from depgather.models.pypijson import ProjectResponse
@@ -30,61 +32,60 @@ RAW_JOINS = " AND "
 HTTP_OK = 200
 
 
-def _source_path_name(path: object) -> str | None:
-	if not isinstance(path, str):
-		return None
+def _parse_uv_requirements(raw_requirements: str, skip_dependencies: set[str]) -> set[Requirement]:
+	skip_names = {canonicalize_name(name) for name in skip_dependencies}
+	parsed_requirements: set[Requirement] = set()
 
-	path_name = Path(path).name
-	return path_name if re.fullmatch(r"(?!-)[A-Za-z0-9_.-]+", path_name) else None
+	for parsed in requirements.parse(raw_requirements):
+		if parsed.editable:
+			continue
+		if not parsed.name or canonicalize_name(parsed.name) in skip_names:
+			continue
 
+		requirement = Requirement(parsed.line)
+		requirement.name = canonicalize_name(requirement.name)
+		parsed_requirements.add(requirement)
 
-def _source_options(source: object) -> list[object]:
-	return list(source) if isinstance(source, list) else [source]
-
-
-def _nested_pyproject(requirements_path: Path, path: object) -> Path | None:
-	if not isinstance(path, str):
-		return None
-
-	source_path = (requirements_path.parent / path).resolve()
-	return source_path if source_path.name == "pyproject.toml" else source_path / "pyproject.toml"
+	return parsed_requirements
 
 
-def _uv_sources(requirements_path: Path) -> dict[str, object]:
+def _gather_uv_requirements(
+	requirements_path: Path,
+	groups: set[str],
+	extras: set[str],
+	skip_dependencies: set[str],
+	base_index_url: str,
+) -> set[Requirement]:
+	command = [
+		"uv",
+		"pip",
+		"compile",
+		"--color",
+		"never",
+		"--index",
+		base_index_url,
+		requirements_path.as_posix(),
+	]
+	for group in groups:
+		command.extend(["--group", group])
+	for extra in extras:
+		command.extend(["--extra", extra])
+
 	try:
-		pyproject = tomli.loads(requirements_path.read_text(encoding="utf-8"))
-	except (OSError, tomli.TOMLDecodeError):
-		return {}
+		result = subprocess.run(  # noqa: S603
+			command,
+			capture_output=True,
+			text=True,
+			check=False,
+		)
+	except OSError as error:
+		raise RuntimeError from error
 
-	sources = pyproject.get("tool", {}).get("uv", {}).get("sources", {})
-	return sources if isinstance(sources, dict) else {}
+	if result.returncode != 0:
+		message = f"Non-zero returncode: {result.stderr}, {result.stdout}"
+		raise RuntimeError(message)
 
-
-def _editable_uv_sources(requirements_path: Path, visited: set[Path] | None = None) -> set[str]:
-	requirements_path = requirements_path.resolve()
-	if visited is None:
-		visited = set()
-	if requirements_path.name != "pyproject.toml" or requirements_path in visited:
-		return set()
-	visited.add(requirements_path)
-
-	editable_sources: set[str] = set()
-
-	for name, source in _uv_sources(requirements_path).items():
-		for source_option in _source_options(source):
-			if not isinstance(source_option, dict):
-				continue
-
-			path = source_option.get("path")
-			if source_option.get("editable"):
-				editable_sources.add(name)
-				if path_name := _source_path_name(path):
-					editable_sources.add(path_name)
-
-			if nested_pyproject := _nested_pyproject(requirements_path, path):
-				editable_sources.update(_editable_uv_sources(nested_pyproject, visited))
-
-	return editable_sources
+	return _parse_uv_requirements(result.stdout, skip_dependencies)
 
 
 class PackageInfoManager:
@@ -109,17 +110,24 @@ class PackageInfoManager:
 	) -> None:
 		for requirements_path in requirements_paths:
 			requirements_path_obj = Path(requirements_path)
-			# DepGather cannot parse the `-e path` lines uv emits for editable sources.
-			self.reqs.update(
-				gather(
-					skipDependencies=skip_dependencies
-					| _editable_uv_sources(requirements_path_obj),
+			try:
+				resolved_requirements = _gather_uv_requirements(
+					requirements_path=requirements_path_obj,
+					groups=groups,
+					extras=extras,
+					skip_dependencies=skip_dependencies,
+					base_index_url=self.base_pypi_url,
+				)
+			except RuntimeError:
+				resolved_requirements = gather(
+					skipDependencies=skip_dependencies,
 					groups=groups,
 					extras=extras,
 					requirementsPath=requirements_path_obj,
 					base_index_url=self.base_pypi_url,
 				)
-			)
+
+			self.reqs.update(resolved_requirements)
 
 	def getPackages(self) -> set[PackageInfo]:
 		"""

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from subprocess import CompletedProcess
 
 import pytest
 from packaging.requirements import Requirement
@@ -36,6 +37,13 @@ def remote_package_info() -> RemotePackageInfo:
 
 def aux_packageinfo(package_name: str) -> PackageInfo:
 	return PackageInfo(name=package_name)
+
+
+def write_pyproject(directory: Path, contents: str) -> Path:
+	directory.mkdir(parents=True, exist_ok=True)
+	pyproject_path = directory / "pyproject.toml"
+	pyproject_path.write_text(contents.strip(), encoding="utf-8")
+	return pyproject_path
 
 
 requests_package = aux_packageinfo("requests")
@@ -287,4 +295,220 @@ package = false
 
 	assert {requirement.name for requirement in package_info_manager.reqs} == {
 		"published-dependency"
+	}
+
+
+def test_resolve_requirements_does_not_skip_inactive_editable_source(
+	package_info_manager: PackageInfoManager,
+	tmp_path: Path,
+	monkeypatch: pytest.MonkeyPatch,
+) -> None:
+	pyproject_path = write_pyproject(
+		tmp_path / "project",
+		"""
+[project]
+name = "project"
+version = "1.0.0"
+dependencies = ["idna==3.10"]
+
+[tool.uv.sources]
+idna = {
+    path = "../local-idna",
+    editable = true,
+    marker = "python_version < '0'",
+}
+""",
+	)
+
+	def fake_run(*_args: object, **_kwargs: object) -> CompletedProcess[str]:
+		return CompletedProcess(
+			args=["uv", "pip", "compile"],
+			returncode=0,
+			stdout="idna==3.10\n",
+			stderr="",
+		)
+
+	monkeypatch.setattr("licensecheck.packageinforesolver.subprocess.run", fake_run)
+
+	package_info_manager.resolve_requirements(
+		requirements_paths={str(pyproject_path)},
+		groups=set(),
+		extras=set(),
+		skip_dependencies=set(),
+	)
+
+	assert {str(requirement) for requirement in package_info_manager.reqs} == {"idna==3.10"}
+
+
+def test_resolve_requirements_keeps_package_sharing_editable_directory_name(
+	package_info_manager: PackageInfoManager, tmp_path: Path
+) -> None:
+	published_path = tmp_path / "published_idna"
+	write_pyproject(
+		published_path,
+		"""
+[project]
+name = "idna"
+version = "3.10"
+""",
+	)
+
+	editable_path = tmp_path / "idna"
+	write_pyproject(
+		editable_path,
+		"""
+[project]
+name = "internal-helper"
+version = "1.0.0"
+""",
+	)
+
+	pyproject_path = write_pyproject(
+		tmp_path / "project",
+		f"""
+[project]
+name = "project"
+version = "1.0.0"
+dependencies = [
+    "internal-helper",
+    "idna @ {published_path.as_uri()}",
+]
+
+[tool.uv.sources]
+internal-helper = {{ path = "../idna", editable = true }}
+""",
+	)
+
+	package_info_manager.resolve_requirements(
+		requirements_paths={str(pyproject_path)},
+		groups=set(),
+		extras=set(),
+		skip_dependencies=set(),
+	)
+
+	assert {requirement.name for requirement in package_info_manager.reqs} == {"idna"}
+
+
+def test_resolve_requirements_handles_editable_uv_workspace_source(
+	package_info_manager: PackageInfoManager, tmp_path: Path
+) -> None:
+	published_path = tmp_path / "published_dependency"
+	write_pyproject(
+		published_path,
+		"""
+[project]
+name = "published-dependency"
+version = "1.0.0"
+""",
+	)
+
+	workspace_path = tmp_path / "workspace"
+	write_pyproject(
+		workspace_path / "packages" / "local_dependency",
+		f"""
+[project]
+name = "local-dependency"
+version = "1.0.0"
+dependencies = ["published-dependency @ {published_path.as_uri()}"]
+""",
+	)
+	pyproject_path = write_pyproject(
+		workspace_path,
+		"""
+[project]
+name = "project"
+version = "1.0.0"
+dependencies = ["local-dependency"]
+
+[tool.uv.sources]
+local-dependency = { workspace = true }
+
+[tool.uv.workspace]
+members = ["packages/local_dependency"]
+""",
+	)
+
+	package_info_manager.resolve_requirements(
+		requirements_paths={str(pyproject_path)},
+		groups=set(),
+		extras=set(),
+		skip_dependencies=set(),
+	)
+
+	assert {requirement.name for requirement in package_info_manager.reqs} == {
+		"published-dependency"
+	}
+
+
+def test_resolve_requirements_handles_editable_path_with_spaces(
+	package_info_manager: PackageInfoManager, tmp_path: Path
+) -> None:
+	published_path = tmp_path / "published_dependency"
+	write_pyproject(
+		published_path,
+		"""
+[project]
+name = "published-dependency"
+version = "1.0.0"
+""",
+	)
+
+	write_pyproject(
+		tmp_path / "local dependency",
+		f"""
+[project]
+name = "local-dependency"
+version = "1.0.0"
+dependencies = ["published-dependency @ {published_path.as_uri()}"]
+""",
+	)
+	pyproject_path = write_pyproject(
+		tmp_path / "project",
+		"""
+[project]
+name = "project"
+version = "1.0.0"
+dependencies = ["local-dependency"]
+
+[tool.uv.sources]
+local-dependency = { path = "../local dependency", editable = true }
+""",
+	)
+
+	package_info_manager.resolve_requirements(
+		requirements_paths={str(pyproject_path)},
+		groups=set(),
+		extras=set(),
+		skip_dependencies=set(),
+	)
+
+	assert {requirement.name for requirement in package_info_manager.reqs} == {
+		"published-dependency"
+	}
+
+
+def test_resolve_requirements_falls_back_for_uv_lock(
+	package_info_manager: PackageInfoManager, tmp_path: Path
+) -> None:
+	lock_path = tmp_path / "uv.lock"
+	lock_path.write_text(
+		"""
+version = 1
+
+[[package]]
+name = "fallback-package"
+version = "1.2.3"
+""".strip(),
+		encoding="utf-8",
+	)
+
+	package_info_manager.resolve_requirements(
+		requirements_paths={str(lock_path)},
+		groups=set(),
+		extras=set(),
+		skip_dependencies=set(),
+	)
+
+	assert {str(requirement) for requirement in package_info_manager.reqs} == {
+		"fallback-package==1.2.3"
 	}
