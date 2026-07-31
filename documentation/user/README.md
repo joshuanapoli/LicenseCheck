@@ -94,7 +94,8 @@ Licensecheck supports a broad range of different tools and workflows. Though ple
 for some of these tools, behaviour may differ from what is expected. For a `pyproject.toml` with an
 adjacent `uv.lock`, Licensecheck exports the locked dependency graph. Otherwise it uses `uv` to
 resolve dependencies. Resolution errors for a `pyproject.toml` are reported directly instead of
-falling back to a less accurate dependency graph.
+falling back to a less accurate dependency graph. Editable local projects emitted by `uv` are
+audited using the project metadata from their own `pyproject.toml` files.
 
 Note that `uv` supports requirements.in files. If a pyproject.toml, setup.py, or setup.cfg file is
 provided, `uv` will extract the requirements for the relevant project. In testing this seems to have

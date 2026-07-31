@@ -14,6 +14,7 @@ from importlib import metadata
 from importlib.metadata._meta import PackageMetadata
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 import license_expression
 import requests
@@ -55,12 +56,38 @@ def _versions_match(expected: str | None, actual: str | None) -> bool:
 		return expected == actual
 
 
-def _parse_uv_requirements(raw_requirements: str, skip_dependencies: set[str]) -> set[Requirement]:
+def _editable_project_path(line: str, base_path: Path) -> Path | None:
+	stripped_line = line.strip()
+	for prefix in ("-e ", "--editable "):
+		if stripped_line.startswith(prefix):
+			target = stripped_line.removeprefix(prefix).strip()
+			break
+	else:
+		return None
+
+	parsed_url = urlparse(target)
+	if parsed_url.scheme and parsed_url.scheme != "file":
+		return None
+
+	path = Path(unquote(parsed_url.path if parsed_url.scheme == "file" else target))
+	if not path.is_absolute():
+		path = base_path / path
+	return path.resolve()
+
+
+def _parse_uv_requirements(
+	raw_requirements: str,
+	skip_dependencies: set[str],
+	base_path: Path,
+) -> tuple[set[Requirement], set[Path]]:
 	skip_names = {canonicalize_name(name) for name in skip_dependencies}
 	parsed_requirements: set[Requirement] = set()
+	editable_paths: set[Path] = set()
 
 	for parsed in requirements.parse(raw_requirements):
 		if parsed.editable:
+			if editable_path := _editable_project_path(parsed.line, base_path):
+				editable_paths.add(editable_path)
 			continue
 		if not parsed.name or canonicalize_name(parsed.name) in skip_names:
 			continue
@@ -69,7 +96,7 @@ def _parse_uv_requirements(raw_requirements: str, skip_dependencies: set[str]) -
 		requirement.name = canonicalize_name(requirement.name)
 		parsed_requirements.add(requirement)
 
-	return parsed_requirements
+	return parsed_requirements, editable_paths
 
 
 def _gather_uv_requirements(
@@ -78,7 +105,7 @@ def _gather_uv_requirements(
 	extras: set[str],
 	skip_dependencies: set[str],
 	base_index_url: str,
-) -> set[Requirement]:
+) -> tuple[set[Requirement], set[Path]]:
 	lock_path = requirements_path.with_name("uv.lock")
 	use_lock = requirements_path.name == "pyproject.toml" and lock_path.is_file()
 	if use_lock:
@@ -133,7 +160,11 @@ def _gather_uv_requirements(
 		message = f"Non-zero returncode: {result.stderr}, {result.stdout}"
 		raise RuntimeError(message)
 
-	return _parse_uv_requirements(result.stdout, skip_dependencies)
+	return _parse_uv_requirements(
+		result.stdout,
+		skip_dependencies,
+		requirements_path.parent.resolve(),
+	)
 
 
 class PackageInfoManager:
@@ -161,7 +192,7 @@ class PackageInfoManager:
 			requirements_path_obj = Path(requirements_path)
 			self._register_local_sources(requirements_path_obj)
 			try:
-				resolved_requirements = _gather_uv_requirements(
+				resolved_requirements, editable_paths = _gather_uv_requirements(
 					requirements_path=requirements_path_obj,
 					groups=groups,
 					extras=extras,
@@ -178,8 +209,41 @@ class PackageInfoManager:
 					requirementsPath=requirements_path_obj,
 					base_index_url=self.base_pypi_url,
 				)
+				editable_paths = set()
 
+			self._register_editable_projects(
+				resolved_requirements,
+				editable_paths,
+				skip_dependencies,
+			)
 			self.reqs.update(resolved_requirements)
+
+	def _register_editable_projects(
+		self,
+		resolved_requirements: set[Requirement],
+		editable_paths: set[Path],
+		skip_dependencies: set[str],
+	) -> None:
+		skip_names = {canonicalize_name(name) for name in skip_dependencies}
+		for editable_path in editable_paths:
+			pyproject_path = (
+				editable_path
+				if editable_path.name == "pyproject.toml"
+				else editable_path / "pyproject.toml"
+			)
+			package = self._read_project_package(pyproject_path)
+			if package is None:
+				continue
+
+			self.local_projects[package.name] = package
+			self._register_local_sources(pyproject_path)
+			if package.name in skip_names:
+				continue
+
+			requirement = package.name
+			if package.version:
+				requirement = f"{requirement}=={package.version}"
+			resolved_requirements.add(Requirement(requirement))
 
 	def _register_local_sources(
 		self,

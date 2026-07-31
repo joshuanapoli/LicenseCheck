@@ -349,6 +349,60 @@ def test_unpinned_requirement_does_not_crash(package_info_manager: PackageInfoMa
 	assert package.errorCode == 0
 
 
+def test_resolve_requirements_audits_editable_project(
+	package_info_manager: PackageInfoManager,
+	tmp_path: Path,
+	monkeypatch: pytest.MonkeyPatch,
+) -> None:
+	write_pyproject(
+		tmp_path / "local_dependency",
+		"""
+[project]
+name = "local-dependency"
+version = "1.2.3"
+license = "LicenseRef-Example-Proprietary"
+""",
+	)
+	pyproject_path = write_pyproject(
+		tmp_path / "project",
+		"""
+[project]
+name = "project"
+version = "1.0.0"
+dependencies = ["local-dependency"]
+
+[tool.uv.sources]
+local-dependency = { path = "../local_dependency", editable = true }
+""",
+	)
+
+	def fake_run(command: list[str], **_kwargs: object) -> CompletedProcess[str]:
+		return CompletedProcess(
+			args=command,
+			returncode=0,
+			stdout="-e ../local_dependency\n",
+			stderr="",
+		)
+
+	monkeypatch.setattr("licensecheck.packageinforesolver.subprocess.run", fake_run)
+
+	package_info_manager.resolve_requirements(
+		requirements_paths={str(pyproject_path)},
+		groups=set(),
+		extras=set(),
+		skip_dependencies=set(),
+	)
+	package = package_info_manager.getPackages().pop()
+
+	assert {str(requirement) for requirement in package_info_manager.reqs} == {
+		"local-dependency==1.2.3"
+	}
+	assert package.name == "local-dependency"
+	assert package.version == "1.2.3"
+	assert package.license == "LicenseRef-Example-Proprietary"
+	assert package.errorCode == 0
+
+
 def test_resolved_requirement_version_is_preserved(
 	package_info_manager: PackageInfoManager,
 	monkeypatch: pytest.MonkeyPatch,
@@ -446,7 +500,9 @@ local-dependency = { path = "../workspace_member", editable = true }
 	)
 
 	assert {requirement.name for requirement in package_info_manager.reqs} == {
-		"transitive-dependency"
+		"local-dependency",
+		"nested-dependency",
+		"transitive-dependency",
 	}
 
 
@@ -535,7 +591,10 @@ package = false
 	)
 
 	assert {requirement.name for requirement in package_info_manager.reqs} == {
-		"published-dependency"
+		"anomaly-detection",
+		"published-dependency",
+		"sdk-extensions",
+		"service-common",
 	}
 
 
@@ -707,7 +766,10 @@ internal-helper = {{ path = "../idna", editable = true }}
 		skip_dependencies=set(),
 	)
 
-	assert {requirement.name for requirement in package_info_manager.reqs} == {"idna"}
+	assert {requirement.name for requirement in package_info_manager.reqs} == {
+		"idna",
+		"internal-helper",
+	}
 
 
 def test_resolve_requirements_handles_editable_uv_workspace_source(
@@ -757,7 +819,8 @@ members = ["packages/local_dependency"]
 	)
 
 	assert {requirement.name for requirement in package_info_manager.reqs} == {
-		"published-dependency"
+		"local-dependency",
+		"published-dependency",
 	}
 
 
@@ -804,7 +867,8 @@ local-dependency = { path = "../local dependency", editable = true }
 	)
 
 	assert {requirement.name for requirement in package_info_manager.reqs} == {
-		"published-dependency"
+		"local-dependency",
+		"published-dependency",
 	}
 
 
