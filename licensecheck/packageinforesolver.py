@@ -25,6 +25,7 @@ from depgather.parse import gather
 from license_expression import Licensing
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
+from packaging.version import InvalidVersion, Version
 
 from licensecheck.models.constants import JOINS, UNKNOWN
 from licensecheck.models.packageinfo import PackageInfo
@@ -32,7 +33,26 @@ from licensecheck.session import session
 
 RAW_JOINS = " AND "
 HTTP_OK = 200
-HTTP_NOT_FOUND = 404
+
+
+def _has_usable_license(license_value: str | None) -> bool:
+	return bool(
+		license_value
+		and license_value.strip()
+		and license_value.strip().upper() not in {UNKNOWN, "NONE"}
+	)
+
+
+def _versions_match(expected: str | None, actual: str | None) -> bool:
+	if expected is None:
+		return True
+	if actual is None:
+		return False
+
+	try:
+		return Version(expected) == Version(actual)
+	except InvalidVersion:
+		return expected == actual
 
 
 def _parse_uv_requirements(raw_requirements: str, skip_dependencies: set[str]) -> set[Requirement]:
@@ -275,29 +295,41 @@ class PackageInfoManager:
 		rpi = RemotePackageInfo(pypi_api=self.base_pypi_url, package=base_pkg_info)
 		rpi.lazy_fetch()
 
-		ipi = IndexPackageInfo(package=base_pkg_info) if rpi.http_code == HTTP_NOT_FOUND else None
+		local_matches = _versions_match(base_pkg_info.version, lpi.get_version())
+		local_name = lpi.get_name() if local_matches else None
+		local_license = lpi.get_license() if local_matches else None
+		remote_license = rpi.get_license()
+
+		needs_index = (not local_name and rpi.http_code != HTTP_OK) or not any(
+			_has_usable_license(value) for value in (local_license, remote_license)
+		)
+		ipi = IndexPackageInfo(package=base_pkg_info) if needs_index else None
 		index_name = ipi.get_name() if ipi is not None else None
+		index_license = ipi.get_license() if ipi is not None else None
+		license_candidates = (local_license, index_license, remote_license)
+		license_value = next(
+			(value for value in license_candidates if _has_usable_license(value)),
+			next((value for value in license_candidates if value), None),
+		)
 
 		pkg_info = PackageInfo(
 			name=package.name,
 			version=base_pkg_info.version
-			or lpi.get_version()
+			or (lpi.get_version() if local_matches else None)
 			or (ipi.get_version() if ipi is not None else None)
 			or rpi.get_version(),
-			size=lpi.get_size() or (ipi.get_size() if ipi is not None else None) or rpi.get_size(),
-			homePage=lpi.get_homePage()
+			size=(lpi.get_size() if local_matches else None)
+			or (ipi.get_size() if ipi is not None else None)
+			or rpi.get_size(),
+			homePage=(lpi.get_homePage() if local_matches else None)
 			or (ipi.get_homePage() if ipi is not None else None)
 			or rpi.get_homePage(),
-			author=lpi.get_author()
+			author=(lpi.get_author() if local_matches else None)
 			or (ipi.get_author() if ipi is not None else None)
 			or rpi.get_author(),
-			license=str(
-				lpi.get_license()
-				or (ipi.get_license() if ipi is not None else None)
-				or rpi.get_license()
-			),
+			license=license_value,
 			errorCode=(
-				0 if rpi.http_code == HTTP_OK or lpi.get_name() or index_name else rpi.http_code
+				0 if rpi.http_code == HTTP_OK or local_name or index_name else rpi.http_code
 			),
 		)
 

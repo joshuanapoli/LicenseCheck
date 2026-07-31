@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from email.message import Message
 from pathlib import Path
 from subprocess import CompletedProcess
 
@@ -178,6 +179,103 @@ License-Expression: MIT
 	assert package.errorCode == 0
 
 
+def test_package_manager_uses_exact_artifact_when_pypi_license_is_missing(
+	package_info_manager: PackageInfoManager,
+	monkeypatch: pytest.MonkeyPatch,
+) -> None:
+	commands: list[list[str]] = []
+
+	def fake_make_req(
+		_self: RemotePackageInfo,
+		url: str,
+		headers: dict[str, str] | None = None,
+	) -> tuple[int, dict[str, object]]:
+		del url, headers
+		return 200, {
+			"info": {
+				"name": "artifact-package",
+				"version": "1.2.3",
+			}
+		}
+
+	def fake_run(command: list[str], **_kwargs: object) -> CompletedProcess[str]:
+		commands.append(command)
+		target = Path(command[command.index("--target") + 1])
+		metadata_path = target / "artifact_package-1.2.3.dist-info" / "METADATA"
+		metadata_path.parent.mkdir()
+		metadata_path.write_text(
+			"""
+Metadata-Version: 2.4
+Name: artifact-package
+Version: 1.2.3
+License-Expression: MIT
+""".strip(),
+			encoding="utf-8",
+		)
+		return CompletedProcess(args=command, returncode=0, stdout="", stderr="")
+
+	monkeypatch.setattr(RemotePackageInfo, "make_req", fake_make_req)
+	monkeypatch.setattr("licensecheck.packageinforesolver.subprocess.run", fake_run)
+	package_info_manager.reqs = {Requirement("artifact-package==1.2.3")}
+
+	package = package_info_manager.getPackages().pop()
+
+	assert package.name == "artifact-package"
+	assert package.version == "1.2.3"
+	assert package.license == "MIT"
+	assert commands[0][-1] == "artifact-package==1.2.3"
+
+
+def test_package_manager_ignores_installed_metadata_from_another_version(
+	package_info_manager: PackageInfoManager,
+	monkeypatch: pytest.MonkeyPatch,
+) -> None:
+	installed_metadata = Message()
+	installed_metadata["Name"] = "artifact-package"
+	installed_metadata["Version"] = "9.9.9"
+	installed_metadata["License-Expression"] = "GPL-3.0-only"
+
+	def fake_make_req(
+		_self: RemotePackageInfo,
+		url: str,
+		headers: dict[str, str] | None = None,
+	) -> tuple[int, dict[str, object]]:
+		del url, headers
+		return 200, {
+			"info": {
+				"name": "artifact-package",
+				"version": "1.2.3",
+			}
+		}
+
+	def fake_run(command: list[str], **_kwargs: object) -> CompletedProcess[str]:
+		target = Path(command[command.index("--target") + 1])
+		metadata_path = target / "artifact_package-1.2.3.dist-info" / "METADATA"
+		metadata_path.parent.mkdir()
+		metadata_path.write_text(
+			"""
+Metadata-Version: 2.4
+Name: artifact-package
+Version: 1.2.3
+License-Expression: MIT
+""".strip(),
+			encoding="utf-8",
+		)
+		return CompletedProcess(args=command, returncode=0, stdout="", stderr="")
+
+	monkeypatch.setattr(
+		"licensecheck.packageinforesolver.metadata.metadata", lambda _name: installed_metadata
+	)
+	monkeypatch.setattr(RemotePackageInfo, "make_req", fake_make_req)
+	monkeypatch.setattr("licensecheck.packageinforesolver.subprocess.run", fake_run)
+	package_info_manager.reqs = {Requirement("artifact-package==1.2.3")}
+
+	package = package_info_manager.getPackages().pop()
+
+	assert package.version == "1.2.3"
+	assert package.license == "MIT"
+
+
 def test_getPackageInfoLocalNotFound() -> None:
 	pkg = LocalPackageInfo(aux_packageinfo("this_package_does_not_exist"))
 	assert pkg.get_size() is None
@@ -269,7 +367,11 @@ def test_resolved_requirement_version_is_preserved(
 			}
 		}
 
+	def fail_artifact_fetch(*_args: object, **_kwargs: object) -> CompletedProcess[str]:
+		pytest.fail("artifact metadata should not be fetched when PyPI declares a license")
+
 	monkeypatch.setattr(RemotePackageInfo, "make_req", fake_make_req)
+	monkeypatch.setattr("licensecheck.packageinforesolver.subprocess.run", fail_artifact_fetch)
 	package_info_manager.reqs = {Requirement("sample==1.0.0.0")}
 
 	package = package_info_manager.getPackages().pop()

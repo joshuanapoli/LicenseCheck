@@ -98,6 +98,22 @@ def test_failed_license_cannot_be_masked_by_compatible_license() -> None:
 	)
 
 
+@pytest.mark.parametrize(
+	("project_license", "dependency_license"),
+	[
+		(L.UNKNOWN, L.MIT),
+		(L.NO_LICENSE, L.MIT),
+		(L.MIT, L.UNKNOWN),
+		(L.MIT, L.NO_LICENSE),
+	],
+)
+def test_unknown_and_missing_licenses_fail_closed(
+	project_license: L,
+	dependency_license: L,
+) -> None:
+	assert not license_matrix.depCompatWMyLice(project_license, {dependency_license})
+
+
 def test_whitelistedLicenseCompat() -> None:
 	assert license_matrix.depCompatWMyLice(L.MIT, {L.MIT}, onlyLicenses={L.MIT})
 	assert license_matrix.depCompatWMyLice(L.MPL, {L.MIT}, onlyLicenses={L.MIT})

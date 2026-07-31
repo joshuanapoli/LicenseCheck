@@ -170,9 +170,9 @@ requirements with `uv`.
 
 Q: The license for my dep has changed in v >1.0, so I'm using v < 1.0, why doesn't licensecheck report the correct license version?
 A: Licensecheck requests the exact resolved version from the PyPI JSON API. If the package is not
-available from public PyPI, it asks `uv` to fetch the exact wheel from the indexes configured for
-the current project and reads the wheel metadata. Index credentials and source selection remain
-`uv`'s responsibility.
+available from public PyPI or that response lacks usable license metadata, it asks `uv` to fetch
+the exact wheel from the indexes configured for the current project and reads the wheel metadata.
+Index credentials and source selection remain `uv`'s responsibility.
 
 ## License lookup format
 

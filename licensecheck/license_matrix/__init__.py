@@ -221,11 +221,13 @@ def liceCompat(
 		return True
 	if len(onlyLicenses) > 0 and (lice not in onlyLicenses):
 		return False
-	licenses = list(L)
-	row, col = licenses.index(myLicense) + 1, licenses.index(lice) + 1
+	if myLicense in {L.UNKNOWN, L.NO_LICENSE} or lice in {L.UNKNOWN, L.NO_LICENSE}:
+		return False
 
 	try:
+		licenses = list(L)
+		row, col = licenses.index(myLicense) + 1, licenses.index(lice) + 1
 		return LICENSE_MATRIX[row][col] == "1"
-	except KeyError:
+	except (IndexError, ValueError):
 		logger.warning(f"Licenses {myLicense} and {lice} cannot be compared")
 		return False
