@@ -62,3 +62,37 @@ def test_check(
 	)
 
 	assert incompatible == expected_incompatible, packages
+
+
+@pytest.mark.parametrize(
+	("ignore_packages", "expected_incompatible"),
+	[
+		({"private-package==1.2.3"}, False),
+		({"private-package==1.2.4"}, True),
+		({"private-package==1.*"}, False),
+	],
+)
+def test_ignore_packages_can_match_versions(
+	mock_package_info_manager: PackageInfoManager,
+	ignore_packages: set[str],
+	*,
+	expected_incompatible: bool,
+) -> None:
+	mock_package_info_manager.getPackages.return_value = {
+		PackageInfo(
+			name="private-package",
+			version="1.2.3",
+			license="PROPRIETARY",
+		)
+	}
+
+	incompatible, packages = check(
+		requirements_paths={"requirements.txt"},
+		groups=set(),
+		extras=set(),
+		this_license=License.MIT,
+		package_info_manager=mock_package_info_manager,
+		ignore_packages=ignore_packages,
+	)
+
+	assert incompatible == expected_incompatible, packages

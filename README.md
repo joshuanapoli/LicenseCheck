@@ -169,9 +169,9 @@ options:
                         Select extras from supported files
   --file FILE, -o FILE  Filename to write output to (omit this for stdout)
   --ignore-packages IGNORE_PACKAGES [IGNORE_PACKAGES ...]
-                        List of packages/dependencies to ignore (compat=True), globs are supported
+                        List of packages/dependencies to ignore (compat=True); names, name==version, and globs are supported
   --fail-packages FAIL_PACKAGES [FAIL_PACKAGES ...]
-                        List of packages/dependencies to fail (compat=False), globs are supported
+                        List of packages/dependencies to fail (compat=False); names, name==version, and globs are supported
   --ignore-licenses IGNORE_LICENSES [IGNORE_LICENSES ...]
                         List of licenses to ignore (skipped, compat may still be False)
   --fail-licenses FAIL_LICENSES [FAIL_LICENSES ...]
@@ -210,8 +210,8 @@ requirements_paths = []       # List of filenames to read from
 groups = []                   # List of selected groups
 extras = []                   # List of selected extras
 file = ""                     # Output file (leave empty for stdout)
-ignore_packages = []          # Packages/dependencies to ignore
-fail_packages = []            # Packages/dependencies that cause failure
+ignore_packages = []          # Names, name==version entries, or globs to ignore
+fail_packages = []            # Names, name==version entries, or globs that fail
 ignore_licenses = []          # Licenses to ignore
 fail_licenses = []            # Licenses that cause failure
 only_licenses = []            # Allowed licenses (all others will fail)

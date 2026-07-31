@@ -9,6 +9,7 @@ from packaging.requirements import Requirement
 from licensecheck.models.constants import UNKNOWN
 from licensecheck.models.packageinfo import PackageInfo
 from licensecheck.packageinforesolver import (
+	IndexPackageInfo,
 	LocalPackageInfo,
 	PackageInfoManager,
 	RemotePackageInfo,
@@ -63,6 +64,118 @@ def test_getPackageInfoPypi(remote_package_info: RemotePackageInfo) -> None:
 	assert pkg.get_name() == "requests"
 	assert pkg.get_author() == "Kenneth Reitz"
 	assert pkg.get_license() == "Apache Software License"
+
+
+def test_remote_package_info_uses_versioned_pypi_endpoint(
+	monkeypatch: pytest.MonkeyPatch,
+) -> None:
+	pkg = RemotePackageInfo(
+		"https://packages.example",
+		PackageInfo(name="sample", version="1.2.3"),
+	)
+	requested_urls: list[str] = []
+
+	def fake_make_req(
+		url: str, headers: dict[str, str] | None = None
+	) -> tuple[int, dict[str, object]]:
+		del headers
+		requested_urls.append(url)
+		return 200, {
+			"info": {
+				"name": "sample",
+				"version": "1.2.3",
+				"license_expression": "MIT",
+			}
+		}
+
+	monkeypatch.setattr(pkg, "make_req", fake_make_req)
+
+	assert pkg.get_license() == "MIT"
+	assert requested_urls == ["https://packages.example/pypi/sample/1.2.3/json"]
+
+
+def test_index_package_info_uses_uv_configured_indexes(
+	monkeypatch: pytest.MonkeyPatch,
+) -> None:
+	pkg = IndexPackageInfo(PackageInfo(name="private-package", version="1.2.3"))
+	commands: list[list[str]] = []
+
+	def fake_run(command: list[str], **_kwargs: object) -> CompletedProcess[str]:
+		commands.append(command)
+		target = Path(command[command.index("--target") + 1])
+		metadata_path = target / "private_package-1.2.3.dist-info" / "METADATA"
+		metadata_path.parent.mkdir()
+		metadata_path.write_text(
+			"""
+Metadata-Version: 2.4
+Name: private-package
+Version: 1.2.3
+License-Expression: LicenseRef-Example-Proprietary
+""".strip(),
+			encoding="utf-8",
+		)
+		return CompletedProcess(args=command, returncode=0, stdout="", stderr="")
+
+	monkeypatch.setattr("licensecheck.packageinforesolver.subprocess.run", fake_run)
+
+	assert pkg.get_name() == "private-package"
+	assert pkg.get_version() == "1.2.3"
+	assert pkg.get_license() == "LicenseRef-Example-Proprietary"
+	assert commands == [
+		[
+			"uv",
+			"pip",
+			"install",
+			"--color",
+			"never",
+			"--no-progress",
+			"--no-deps",
+			"--only-binary",
+			":all:",
+			"--target",
+			commands[0][commands[0].index("--target") + 1],
+			"private-package==1.2.3",
+		]
+	]
+
+
+def test_package_manager_uses_private_index_when_pypi_is_missing(
+	package_info_manager: PackageInfoManager,
+	monkeypatch: pytest.MonkeyPatch,
+) -> None:
+	def fake_make_req(
+		_self: RemotePackageInfo,
+		url: str,
+		headers: dict[str, str] | None = None,
+	) -> tuple[int, dict[str, object]]:
+		del url, headers
+		return 404, {}
+
+	def fake_run(command: list[str], **_kwargs: object) -> CompletedProcess[str]:
+		target = Path(command[command.index("--target") + 1])
+		metadata_path = target / "private_package-1.2.3.dist-info" / "METADATA"
+		metadata_path.parent.mkdir()
+		metadata_path.write_text(
+			"""
+Metadata-Version: 2.4
+Name: private-package
+Version: 1.2.3
+License-Expression: MIT
+""".strip(),
+			encoding="utf-8",
+		)
+		return CompletedProcess(args=command, returncode=0, stdout="", stderr="")
+
+	monkeypatch.setattr(RemotePackageInfo, "make_req", fake_make_req)
+	monkeypatch.setattr("licensecheck.packageinforesolver.subprocess.run", fake_run)
+	package_info_manager.reqs = {Requirement("private-package==1.2.3")}
+
+	package = package_info_manager.getPackages().pop()
+
+	assert package.name == "private-package"
+	assert package.version == "1.2.3"
+	assert package.license == "MIT"
+	assert package.errorCode == 0
 
 
 def test_getPackageInfoLocalNotFound() -> None:
@@ -136,6 +249,32 @@ def test_unpinned_requirement_does_not_crash(package_info_manager: PackageInfoMa
 
 	assert package.name == "sample"
 	assert package.errorCode == 0
+
+
+def test_resolved_requirement_version_is_preserved(
+	package_info_manager: PackageInfoManager,
+	monkeypatch: pytest.MonkeyPatch,
+) -> None:
+	def fake_make_req(
+		_self: RemotePackageInfo,
+		url: str,
+		headers: dict[str, str] | None = None,
+	) -> tuple[int, dict[str, object]]:
+		del url, headers
+		return 200, {
+			"info": {
+				"name": "sample",
+				"version": "1.0.0",
+				"license_expression": "MIT",
+			}
+		}
+
+	monkeypatch.setattr(RemotePackageInfo, "make_req", fake_make_req)
+	package_info_manager.reqs = {Requirement("sample==1.0.0.0")}
+
+	package = package_info_manager.getPackages().pop()
+
+	assert package.version == "1.0.0.0"
 
 
 def test_resolve_requirements_handles_nested_editable_uv_sources(
@@ -340,6 +479,86 @@ idna = {
 	assert {str(requirement) for requirement in package_info_manager.reqs} == {"idna==3.10"}
 
 
+def test_resolve_requirements_uses_uv_prerelease_setting(
+	package_info_manager: PackageInfoManager,
+	tmp_path: Path,
+	monkeypatch: pytest.MonkeyPatch,
+) -> None:
+	pyproject_path = write_pyproject(
+		tmp_path,
+		"""
+[project]
+name = "project"
+version = "1.0.0"
+dependencies = ["prerelease-package"]
+
+[tool.uv]
+prerelease = "allow"
+""",
+	)
+	commands: list[list[str]] = []
+
+	def fake_run(command: list[str], **_kwargs: object) -> CompletedProcess[str]:
+		commands.append(command)
+		return CompletedProcess(
+			args=command,
+			returncode=0,
+			stdout="prerelease-package==1.0.0.dev1\n",
+			stderr="",
+		)
+
+	monkeypatch.setattr("licensecheck.packageinforesolver.subprocess.run", fake_run)
+
+	package_info_manager.resolve_requirements(
+		requirements_paths={str(pyproject_path)},
+		groups=set(),
+		extras=set(),
+		skip_dependencies=set(),
+	)
+
+	assert commands[0][-2:] == ["--prerelease", "allow"]
+
+
+def test_resolve_requirements_prefers_adjacent_uv_lock(
+	package_info_manager: PackageInfoManager,
+	tmp_path: Path,
+	monkeypatch: pytest.MonkeyPatch,
+) -> None:
+	pyproject_path = write_pyproject(
+		tmp_path,
+		"""
+[project]
+name = "project"
+version = "1.0.0"
+dependencies = ["dependency>=1"]
+""",
+	)
+	(tmp_path / "uv.lock").write_text("version = 1", encoding="utf-8")
+	commands: list[list[str]] = []
+
+	def fake_run(command: list[str], **_kwargs: object) -> CompletedProcess[str]:
+		commands.append(command)
+		return CompletedProcess(
+			args=command,
+			returncode=0,
+			stdout="dependency==1.2.3\n",
+			stderr="",
+		)
+
+	monkeypatch.setattr("licensecheck.packageinforesolver.subprocess.run", fake_run)
+
+	package_info_manager.resolve_requirements(
+		requirements_paths={str(pyproject_path)},
+		groups=set(),
+		extras=set(),
+		skip_dependencies=set(),
+	)
+
+	assert commands[0][:4] == ["uv", "export", "--project", tmp_path.as_posix()]
+	assert "--locked" in commands[0]
+	assert {str(requirement) for requirement in package_info_manager.reqs} == {"dependency==1.2.3"}
+
+
 def test_resolve_requirements_keeps_package_sharing_editable_directory_name(
 	package_info_manager: PackageInfoManager, tmp_path: Path
 ) -> None:
@@ -487,6 +706,58 @@ local-dependency = { path = "../local dependency", editable = true }
 	}
 
 
+def test_resolve_requirements_uses_local_project_license_metadata(
+	package_info_manager: PackageInfoManager,
+	tmp_path: Path,
+	monkeypatch: pytest.MonkeyPatch,
+) -> None:
+	local_path = tmp_path / "local_dependency"
+	write_pyproject(
+		local_path,
+		"""
+[project]
+name = "local-dependency"
+version = "1.2.3"
+license = "LicenseRef-Example-Proprietary"
+""",
+	)
+	pyproject_path = write_pyproject(
+		tmp_path / "project",
+		"""
+[project]
+name = "project"
+version = "1.0.0"
+dependencies = ["local-dependency"]
+
+[tool.uv.sources]
+local-dependency = { path = "../local_dependency" }
+""",
+	)
+
+	def fake_run(*_args: object, **_kwargs: object) -> CompletedProcess[str]:
+		return CompletedProcess(
+			args=["uv", "pip", "compile"],
+			returncode=0,
+			stdout=f"local-dependency @ {local_path.as_uri()}\n",
+			stderr="",
+		)
+
+	monkeypatch.setattr("licensecheck.packageinforesolver.subprocess.run", fake_run)
+
+	package_info_manager.resolve_requirements(
+		requirements_paths={str(pyproject_path)},
+		groups=set(),
+		extras=set(),
+		skip_dependencies=set(),
+	)
+	package = package_info_manager.getPackages().pop()
+
+	assert package.name == "local-dependency"
+	assert package.version == "1.2.3"
+	assert package.license == "LicenseRef-Example-Proprietary"
+	assert package.errorCode == 0
+
+
 def test_resolve_requirements_falls_back_for_uv_lock(
 	package_info_manager: PackageInfoManager, tmp_path: Path
 ) -> None:
@@ -512,3 +783,37 @@ version = "1.2.3"
 	assert {str(requirement) for requirement in package_info_manager.reqs} == {
 		"fallback-package==1.2.3"
 	}
+
+
+def test_resolve_requirements_preserves_pyproject_resolution_error(
+	package_info_manager: PackageInfoManager,
+	tmp_path: Path,
+	monkeypatch: pytest.MonkeyPatch,
+) -> None:
+	pyproject_path = write_pyproject(
+		tmp_path,
+		"""
+[project]
+name = "project"
+version = "1.0.0"
+dependencies = ["dependency"]
+""",
+	)
+
+	def fake_run(*_args: object, **_kwargs: object) -> CompletedProcess[str]:
+		return CompletedProcess(
+			args=["uv", "pip", "compile"],
+			returncode=1,
+			stdout="",
+			stderr="index unavailable",
+		)
+
+	monkeypatch.setattr("licensecheck.packageinforesolver.subprocess.run", fake_run)
+
+	with pytest.raises(RuntimeError, match="index unavailable"):
+		package_info_manager.resolve_requirements(
+			requirements_paths={str(pyproject_path)},
+			groups=set(),
+			extras=set(),
+			skip_dependencies=set(),
+		)

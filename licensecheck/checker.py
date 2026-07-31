@@ -11,6 +11,17 @@ from licensecheck.models.packageinfo import PackageInfo
 from licensecheck.packageinforesolver import PackageInfoManager
 
 
+def _package_matches(package: PackageInfo, patterns: set[str]) -> bool:
+	package_names = {package.name.upper()}
+	if package.version:
+		package_names.add(f"{package.name}=={package.version}".upper())
+	return any(
+		fnmatch(package_name, pattern.upper())
+		for package_name in package_names
+		for pattern in patterns
+	)
+
+
 def check(
 	requirements_paths: set[str],
 	groups: set[str],
@@ -53,10 +64,9 @@ def check(
 	for package in packages:
 		# Deal with --ignore-packages and --fail-packages
 		package.licenseCompat = False
-		packageName = package.name.upper()
-		if any(fnmatch(packageName, pattern.upper()) for pattern in ignore_packages):
+		if _package_matches(package, ignore_packages):
 			package.licenseCompat = True
-		elif any(fnmatch(packageName, pattern.upper()) for pattern in fail_packages):
+		elif _package_matches(package, fail_packages):
 			pass  # package.licenseCompat = False
 		# Else get compat with myLice
 		else:

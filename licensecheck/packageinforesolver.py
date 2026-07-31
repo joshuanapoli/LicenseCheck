@@ -6,7 +6,9 @@ import configparser
 import contextlib
 import re
 import subprocess
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from email.message import Message
 from importlib import metadata
 from importlib.metadata._meta import PackageMetadata
@@ -30,6 +32,7 @@ from licensecheck.session import session
 
 RAW_JOINS = " AND "
 HTTP_OK = 200
+HTTP_NOT_FOUND = 404
 
 
 def _parse_uv_requirements(raw_requirements: str, skip_dependencies: set[str]) -> set[Requirement]:
@@ -56,20 +59,45 @@ def _gather_uv_requirements(
 	skip_dependencies: set[str],
 	base_index_url: str,
 ) -> set[Requirement]:
-	command = [
-		"uv",
-		"pip",
-		"compile",
-		"--color",
-		"never",
-		"--index",
-		base_index_url,
-		requirements_path.as_posix(),
-	]
+	lock_path = requirements_path.with_name("uv.lock")
+	use_lock = requirements_path.name == "pyproject.toml" and lock_path.is_file()
+	if use_lock:
+		command = [
+			"uv",
+			"export",
+			"--project",
+			requirements_path.parent.as_posix(),
+			"--format",
+			"requirements.txt",
+			"--locked",
+			"--no-hashes",
+			"--no-header",
+			"--no-default-groups",
+			"--no-emit-project",
+			"--color",
+			"never",
+		]
+	else:
+		command = [
+			"uv",
+			"pip",
+			"compile",
+			"--color",
+			"never",
+			"--index",
+			base_index_url,
+			requirements_path.as_posix(),
+		]
 	for group in groups:
 		command.extend(["--group", group])
 	for extra in extras:
 		command.extend(["--extra", extra])
+
+	if not use_lock and requirements_path.name == "pyproject.toml":
+		pyproject = tomli.loads(requirements_path.read_text(encoding="utf-8"))
+		prerelease = pyproject.get("tool", {}).get("uv", {}).get("prerelease")
+		if prerelease:
+			command.extend(["--prerelease", prerelease])
 
 	try:
 		result = subprocess.run(  # noqa: S603
@@ -100,6 +128,7 @@ class PackageInfoManager:
 		"""
 		self.base_pypi_url = base_pypi_url
 		self.reqs: set[Requirement] = set()
+		self.local_projects: dict[str, PackageInfo] = {}
 
 	def resolve_requirements(
 		self,
@@ -110,6 +139,7 @@ class PackageInfoManager:
 	) -> None:
 		for requirements_path in requirements_paths:
 			requirements_path_obj = Path(requirements_path)
+			self._register_local_sources(requirements_path_obj)
 			try:
 				resolved_requirements = _gather_uv_requirements(
 					requirements_path=requirements_path_obj,
@@ -119,6 +149,8 @@ class PackageInfoManager:
 					base_index_url=self.base_pypi_url,
 				)
 			except RuntimeError:
+				if requirements_path_obj.name == "pyproject.toml":
+					raise
 				resolved_requirements = gather(
 					skipDependencies=skip_dependencies,
 					groups=groups,
@@ -128,6 +160,77 @@ class PackageInfoManager:
 				)
 
 			self.reqs.update(resolved_requirements)
+
+	def _register_local_sources(
+		self,
+		pyproject_path: Path,
+		seen: set[Path] | None = None,
+	) -> None:
+		if pyproject_path.name != "pyproject.toml" or not pyproject_path.is_file():
+			return
+
+		resolved_path = pyproject_path.resolve()
+		seen = seen or set()
+		if resolved_path in seen:
+			return
+		seen.add(resolved_path)
+
+		pyproject = tomli.loads(pyproject_path.read_text(encoding="utf-8"))
+		uv_config = pyproject.get("tool", {}).get("uv", {})
+		source_paths: set[Path] = set()
+
+		for source in uv_config.get("sources", {}).values():
+			source_options = source if isinstance(source, list) else [source]
+			for source_option in source_options:
+				if not isinstance(source_option, dict) or "path" not in source_option:
+					continue
+				source_path = pyproject_path.parent / source_option["path"]
+				source_paths.add(
+					source_path
+					if source_path.name == "pyproject.toml"
+					else source_path / "pyproject.toml"
+				)
+
+		for member_pattern in uv_config.get("workspace", {}).get("members", []):
+			for member_path in pyproject_path.parent.glob(member_pattern):
+				source_paths.add(member_path / "pyproject.toml")
+
+		for source_path in source_paths:
+			source_package = self._read_project_package(source_path)
+			if source_package is not None:
+				self.local_projects[source_package.name] = source_package
+			self._register_local_sources(source_path, seen)
+
+	@staticmethod
+	def _read_project_package(pyproject_path: Path) -> PackageInfo | None:
+		if not pyproject_path.is_file():
+			return None
+
+		pyproject = tomli.loads(pyproject_path.read_text(encoding="utf-8"))
+		project = pyproject.get("project", {})
+		name = project.get("name")
+		if not name:
+			return None
+
+		license_value = project.get("license", UNKNOWN)
+		if isinstance(license_value, dict):
+			license_value = license_value.get("text", UNKNOWN)
+
+		authors = project.get("authors", [])
+		author_names = [
+			author.get("name", "") if isinstance(author, dict) else str(author)
+			for author in authors
+		]
+		project_urls = project.get("urls", {})
+
+		return PackageInfo(
+			name=canonicalize_name(name),
+			version=project.get("version"),
+			homePage=project_urls.get("Homepage") or project_urls.get("homepage"),
+			author=", ".join(filter(None, author_names)),
+			license=str(license_value),
+			errorCode=0,
+		)
 
 	def getPackages(self) -> set[PackageInfo]:
 		"""
@@ -149,9 +252,16 @@ class PackageInfoManager:
 		versions: set[str | None] = {None}
 		package.name = canonicalize_name(package.name)
 
+		if local_project := self.local_projects.get(package.name):
+			return replace(local_project)
+
 		specifier = getattr(package, "specifier", None)
 		if specifier is not None:
-			parsed_versions = {item.version for item in specifier}
+			parsed_versions = {
+				item.version
+				for item in specifier
+				if item.operator in {"==", "==="} and "*" not in item.version
+			}
 			if parsed_versions:
 				versions = parsed_versions
 
@@ -163,15 +273,32 @@ class PackageInfoManager:
 
 		lpi = LocalPackageInfo(package=base_pkg_info)
 		rpi = RemotePackageInfo(pypi_api=self.base_pypi_url, package=base_pkg_info)
+		rpi.lazy_fetch()
+
+		ipi = IndexPackageInfo(package=base_pkg_info) if rpi.http_code == HTTP_NOT_FOUND else None
+		index_name = ipi.get_name() if ipi is not None else None
 
 		pkg_info = PackageInfo(
 			name=package.name,
-			version=lpi.get_version() or rpi.get_version(),
-			size=lpi.get_size() or rpi.get_size(),
-			homePage=lpi.get_homePage() or rpi.get_homePage(),
-			author=lpi.get_author() or rpi.get_author(),
-			license=str(lpi.get_license() or rpi.get_license()),
-			errorCode=rpi.http_code if rpi.http_code != HTTP_OK else 0,
+			version=base_pkg_info.version
+			or lpi.get_version()
+			or (ipi.get_version() if ipi is not None else None)
+			or rpi.get_version(),
+			size=lpi.get_size() or (ipi.get_size() if ipi is not None else None) or rpi.get_size(),
+			homePage=lpi.get_homePage()
+			or (ipi.get_homePage() if ipi is not None else None)
+			or rpi.get_homePage(),
+			author=lpi.get_author()
+			or (ipi.get_author() if ipi is not None else None)
+			or rpi.get_author(),
+			license=str(
+				lpi.get_license()
+				or (ipi.get_license() if ipi is not None else None)
+				or rpi.get_license()
+			),
+			errorCode=(
+				0 if rpi.http_code == HTTP_OK or lpi.get_name() or index_name else rpi.http_code
+			),
 		)
 
 		# normailzing the license
@@ -237,6 +364,85 @@ class LocalPackageInfo:
 			return None  # Package not found
 
 
+class IndexPackageInfo:
+	"""Handles package metadata from indexes configured for uv."""
+
+	def __init__(self, package: PackageInfo) -> None:
+		self.package = package
+		self.meta: PackageMetadata = Message()
+		self.fetched = False
+
+	def lazy_fetch(self) -> None:
+		if self.fetched:
+			return
+		self.fetched = True
+
+		requirement = self.package.name
+		if self.package.version:
+			requirement = f"{requirement}=={self.package.version}"
+
+		with tempfile.TemporaryDirectory(prefix="licensecheck-") as target:
+			command = [
+				"uv",
+				"pip",
+				"install",
+				"--color",
+				"never",
+				"--no-progress",
+				"--no-deps",
+				"--only-binary",
+				":all:",
+				"--target",
+				target,
+				requirement,
+			]
+			try:
+				result = subprocess.run(  # noqa: S603
+					command,
+					capture_output=True,
+					text=True,
+					check=False,
+				)
+			except OSError:
+				return
+
+			if result.returncode != 0:
+				return
+
+			for distribution in metadata.distributions(path=[target]):
+				name = distribution.metadata.get("Name")
+				if name and canonicalize_name(name) == self.package.name:
+					self.meta = distribution.metadata
+					return
+
+	def get_license(self) -> str | None:
+		self.lazy_fetch()
+		return (
+			self.meta.get("License-Expression")
+			or from_classifiers(self.meta.get_all("Classifier"))
+			or self.meta.get("License")
+		)
+
+	def get_name(self) -> str | None:
+		self.lazy_fetch()
+		return self.meta.get("Name")
+
+	def get_version(self) -> str | None:
+		self.lazy_fetch()
+		return self.meta.get("Version")
+
+	def get_homePage(self) -> str | None:
+		self.lazy_fetch()
+		return self.meta.get("Home-page")
+
+	def get_author(self) -> str | None:
+		self.lazy_fetch()
+		return self.meta.get("Author")
+
+	def get_size(self) -> None:
+		return None
+
+
 class RemotePackageInfo:
 	"""Handles retrieval of package info from PyPI."""
 
@@ -249,12 +455,11 @@ class RemotePackageInfo:
 
 	def lazy_fetch(self) -> None:
 		if self.resp is None:
-			# Attempt to get versioned info first
-			rc, raw_resp = self.make_req(
-				url=f"{self.pypi_api_pypi}{self.package.name}/{self.package.version}/json"
-			)
-			# Otherwise just get the latest
-			if rc != HTTP_OK:
+			if self.package.version:
+				rc, raw_resp = self.make_req(
+					url=f"{self.pypi_api_pypi}/{self.package.name}/{self.package.version}/json"
+				)
+			else:
 				rc, raw_resp = self.make_req(url=f"{self.pypi_api_pypi}/{self.package.name}/json")
 
 			self.http_code = rc

@@ -183,6 +183,9 @@ def depCompatWMyLice(
 	ignoreLicenses = ignoreLicenses or set()
 	onlyLicenses = onlyLicenses or set()
 
+	if depLice & failLicenses:
+		return False
+
 	return any(
 		liceCompat(
 			myLicense,

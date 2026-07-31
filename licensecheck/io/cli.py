@@ -66,12 +66,18 @@ def cli() -> None:  # pragma: no cover
 	)
 	parser.add_argument(
 		"--ignore-packages",
-		help="set of packages/dependencies to ignore (compat=True), globs are supported",
+		help=(
+			"set of packages/dependencies to ignore (compat=True); names, "
+			"name==version, and globs are supported"
+		),
 		nargs="+",
 	)
 	parser.add_argument(
 		"--fail-packages",
-		help="set of packages/dependencies to fail (compat=False), globs are supported",
+		help=(
+			"set of packages/dependencies to fail (compat=False); names, "
+			"name==version, and globs are supported"
+		),
 		nargs="+",
 	)
 	parser.add_argument(

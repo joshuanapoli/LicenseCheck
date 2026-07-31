@@ -90,6 +90,14 @@ def test_dualLicenseCompat() -> None:
 	assert license_matrix.depCompatWMyLice(L.MIT, {L.GPL_2, L.MIT})
 
 
+def test_failed_license_cannot_be_masked_by_compatible_license() -> None:
+	assert not license_matrix.depCompatWMyLice(
+		L.MIT,
+		{L.GPL_2, L.MIT},
+		failLicenses={L.GPL_2},
+	)
+
+
 def test_whitelistedLicenseCompat() -> None:
 	assert license_matrix.depCompatWMyLice(L.MIT, {L.MIT}, onlyLicenses={L.MIT})
 	assert license_matrix.depCompatWMyLice(L.MPL, {L.MIT}, onlyLicenses={L.MIT})
