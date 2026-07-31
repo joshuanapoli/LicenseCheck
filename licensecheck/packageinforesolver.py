@@ -4,17 +4,19 @@ from __future__ import annotations
 
 import configparser
 import contextlib
+import os
 import re
 import subprocess
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from email.message import Message
 from importlib import metadata
 from importlib.metadata._meta import PackageMetadata
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
+from urllib.request import url2pathname
 
 import license_expression
 import requests
@@ -24,7 +26,7 @@ from boolean.boolean import Expression
 from depgather.models.pypijson import ProjectResponse
 from depgather.parse import gather
 from license_expression import Licensing
-from packaging.requirements import Requirement
+from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
@@ -34,6 +36,28 @@ from licensecheck.session import session
 
 RAW_JOINS = " AND "
 HTTP_OK = 200
+
+
+class UvUnavailableError(RuntimeError):
+	"""Raised when the optional uv executable is unavailable."""
+
+
+@dataclass(frozen=True)
+class _UvIndex:
+	name: str | None
+	url: str
+	format: str | None = None
+
+
+@dataclass(frozen=True)
+class _UvResolutionContext:
+	directory: Path
+	base_index_url: str
+	source_url: str | None = None
+	index_args: tuple[str, ...] = ()
+	index_environment: tuple[tuple[str, str], ...] = ()
+	prefer_artifact: bool = False
+	remote_matches_source: bool = False
 
 
 def _has_usable_license(license_value: str | None) -> bool:
@@ -56,6 +80,237 @@ def _versions_match(expected: str | None, actual: str | None) -> bool:
 		return expected == actual
 
 
+def _exact_requirement_version(requirement: Requirement | PackageInfo) -> str | None:
+	if not isinstance(requirement, Requirement):
+		return requirement.version
+	versions = {
+		item.version
+		for item in requirement.specifier
+		if item.operator in {"==", "==="} and "*" not in item.version
+	}
+	return next(iter(versions)) if len(versions) == 1 else None
+
+
+def _requirement_key(
+	requirement: Requirement | PackageInfo,
+) -> tuple[str, str | None, str | None]:
+	return (
+		canonicalize_name(requirement.name),
+		_exact_requirement_version(requirement),
+		getattr(requirement, "url", None),
+	)
+
+
+def _normalized_index_url(url: str) -> str:
+	parsed = urlparse(url)
+	if not parsed.scheme and Path(url).is_absolute():
+		return Path(url).resolve().as_uri().rstrip("/")
+	if parsed.scheme == "file":
+		return Path(url2pathname(unquote(parsed.path))).resolve().as_uri().rstrip("/")
+	normalized = url.rstrip("/").removesuffix("/simple")
+	parsed = urlparse(normalized)
+	if parsed.hostname:
+		host = parsed.hostname.lower()
+		if parsed.port:
+			host = f"{host}:{parsed.port}"
+		normalized = parsed._replace(netloc=host, query="", fragment="").geturl()
+	return normalized
+
+
+def _is_public_pypi(url: str) -> bool:
+	parsed = urlparse(_normalized_index_url(url))
+	return parsed.hostname in {"pypi.org", "www.pypi.org"} and parsed.path in {"", "/"}
+
+
+def _same_index(left: str, right: str) -> bool:
+	return _normalized_index_url(left) == _normalized_index_url(right)
+
+
+def _read_uv_configuration(directory: Path) -> tuple[dict[str, Any], Path]:
+	for candidate_directory in (directory, *directory.parents):
+		uv_toml = candidate_directory / "uv.toml"
+		if uv_toml.is_file():
+			return tomli.loads(uv_toml.read_text(encoding="utf-8")), candidate_directory
+
+		pyproject_path = candidate_directory / "pyproject.toml"
+		if pyproject_path.is_file():
+			pyproject = tomli.loads(pyproject_path.read_text(encoding="utf-8"))
+			uv_config = pyproject.get("tool", {}).get("uv")
+			if isinstance(uv_config, dict):
+				return uv_config, candidate_directory
+
+	return {}, directory
+
+
+def _resolved_uv_index_url(raw_url: object, config_directory: Path) -> str:
+	url = str(raw_url)
+	if Path(url).is_absolute() or not urlparse(url).scheme:
+		return (config_directory / url).resolve().as_uri()
+	return url
+
+
+def _legacy_uv_indexes(
+	config: dict[str, Any],
+	config_directory: Path,
+) -> list[_UvIndex]:
+	indexes: list[_UvIndex] = []
+	default_index = config.get("index-url")
+	if default_index:
+		indexes.append(
+			_UvIndex(
+				name=None,
+				url=_resolved_uv_index_url(default_index, config_directory),
+			)
+		)
+	extra_indexes = config.get("extra-index-url", [])
+	if isinstance(extra_indexes, str):
+		extra_indexes = [extra_indexes]
+	indexes.extend(
+		_UvIndex(name=None, url=_resolved_uv_index_url(url, config_directory))
+		for url in extra_indexes
+	)
+	find_links = config.get("find-links", [])
+	if isinstance(find_links, str):
+		find_links = [find_links]
+	indexes.extend(
+		_UvIndex(
+			name=None,
+			url=_resolved_uv_index_url(url, config_directory),
+			format="flat",
+		)
+		for url in find_links
+	)
+	return indexes
+
+
+def _configured_uv_indexes(
+	uv_config: dict[str, Any],
+	config_directory: Path,
+) -> list[_UvIndex]:
+
+	raw_indexes = uv_config.get("index", [])
+	if isinstance(raw_indexes, dict):
+		raw_indexes = [raw_indexes]
+
+	indexes: list[_UvIndex] = []
+	for index in raw_indexes:
+		if not isinstance(index, dict) or not index.get("url"):
+			continue
+		indexes.append(
+			_UvIndex(
+				name=index.get("name"),
+				url=_resolved_uv_index_url(index["url"], config_directory),
+				format=index.get("format"),
+			)
+		)
+
+	indexes.extend(_legacy_uv_indexes(uv_config, config_directory))
+	pip_config = uv_config.get("pip", {})
+	if isinstance(pip_config, dict):
+		indexes.extend(_legacy_uv_indexes(pip_config, config_directory))
+
+	return indexes
+
+
+def _environment_uv_indexes() -> list[_UvIndex]:
+	indexes: list[_UvIndex] = []
+	for variable in ("UV_INDEX", "UV_EXTRA_INDEX_URL"):
+		for value in os.environ.get(variable, "").split():
+			if urlparse(value).scheme:
+				indexes.append(_UvIndex(name=None, url=value))
+				continue
+			name, separator, url = value.partition("=")
+			indexes.append(_UvIndex(name=name if separator else None, url=url or name))
+	indexes.extend(
+		_UvIndex(name=None, url=value)
+		for variable in ("UV_DEFAULT_INDEX", "UV_INDEX_URL")
+		if (value := os.environ.get(variable))
+	)
+	indexes.extend(
+		_UvIndex(name=None, url=value, format="flat")
+		for value in os.environ.get("UV_FIND_LINKS", "").split()
+	)
+	return indexes
+
+
+def _index_invocation_for_source(
+	source_url: str,
+	indexes: list[_UvIndex],
+) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
+	matching_index = next(
+		(index for index in indexes if _same_index(index.url, source_url)),
+		None,
+	)
+	if matching_index is not None and matching_index.format == "flat":
+		parsed_index = urlparse(matching_index.url)
+		if parsed_index.username or parsed_index.password or parsed_index.query:
+			return ("--no-index",), (("UV_FIND_LINKS", matching_index.url),)
+		return ("--no-index", "--find-links", matching_index.url), ()
+
+	if matching_index is not None and matching_index.name:
+		parsed_index = urlparse(matching_index.url)
+		if parsed_index.username or parsed_index.password or parsed_index.query:
+			index_value = f"{matching_index.name}={matching_index.url}"
+			return (), (("UV_INDEX", index_value),)
+		return (
+			("--index", f"{matching_index.name}={source_url}"),
+			(),
+		)
+
+	if matching_index is not None and (
+		urlparse(matching_index.url).username
+		or urlparse(matching_index.url).password
+		or urlparse(matching_index.url).query
+	):
+		return (), (("UV_INDEX", matching_index.url),)
+	if urlparse(source_url).username or urlparse(source_url).password or urlparse(source_url).query:
+		return (), (("UV_INDEX", source_url),)
+
+	return ("--index", source_url), ()
+
+
+def _annotated_requirement_sources(
+	raw_requirements: str,
+) -> dict[tuple[str, str | None, str | None], str]:
+	sources: dict[tuple[str, str | None, str | None], str] = {}
+	current_requirement: Requirement | None = None
+	for raw_line in raw_requirements.splitlines():
+		line = raw_line.strip()
+		if line.startswith("# from ") and current_requirement is not None:
+			sources[_requirement_key(current_requirement)] = line.removeprefix("# from ").strip()
+			continue
+		if not line or line.startswith("#"):
+			continue
+		if line.startswith(("-e ", "--editable ", "--")):
+			current_requirement = None
+			continue
+		try:
+			current_requirement = Requirement(line)
+		except InvalidRequirement:
+			current_requirement = None
+	return sources
+
+
+def _locked_requirement_sources(
+	lock_path: Path,
+) -> dict[tuple[str, str | None, str | None], str]:
+	if not lock_path.is_file():
+		return {}
+
+	lock = tomli.loads(lock_path.read_text(encoding="utf-8"))
+	sources: dict[tuple[str, str | None, str | None], str] = {}
+	for package in lock.get("package", []):
+		if not isinstance(package, dict):
+			continue
+		name = package.get("name")
+		version = package.get("version")
+		source = package.get("source", {})
+		registry = source.get("registry") if isinstance(source, dict) else None
+		if name and registry:
+			sources[(canonicalize_name(name), version, None)] = str(registry)
+	return sources
+
+
 def _editable_project_path(line: str, base_path: Path) -> Path | None:
 	stripped_line = line.strip()
 	for prefix in ("-e ", "--editable "):
@@ -69,7 +324,21 @@ def _editable_project_path(line: str, base_path: Path) -> Path | None:
 	if parsed_url.scheme and parsed_url.scheme != "file":
 		return None
 
-	path = Path(unquote(parsed_url.path if parsed_url.scheme == "file" else target))
+	path_value = parsed_url.path if parsed_url.scheme == "file" else target
+	path = Path(url2pathname(unquote(path_value)))
+	if not path.is_absolute():
+		path = base_path / path
+	return path.resolve()
+
+
+def _requirement_project_path(requirement: Requirement, base_path: Path) -> Path | None:
+	if not requirement.url:
+		return None
+	parsed_url = urlparse(requirement.url)
+	if parsed_url.scheme != "file":
+		return None
+
+	path = Path(url2pathname(unquote(parsed_url.path)))
 	if not path.is_absolute():
 		path = base_path / path
 	return path.resolve()
@@ -79,7 +348,11 @@ def _parse_uv_requirements(
 	raw_requirements: str,
 	skip_dependencies: set[str],
 	base_path: Path,
-) -> tuple[set[Requirement], set[Path]]:
+) -> tuple[
+	set[Requirement],
+	set[Path],
+	dict[tuple[str, str | None, str | None], str],
+]:
 	skip_names = {canonicalize_name(name) for name in skip_dependencies}
 	parsed_requirements: set[Requirement] = set()
 	editable_paths: set[Path] = set()
@@ -96,20 +369,17 @@ def _parse_uv_requirements(
 		requirement.name = canonicalize_name(requirement.name)
 		parsed_requirements.add(requirement)
 
-	return parsed_requirements, editable_paths
+	return parsed_requirements, editable_paths, _annotated_requirement_sources(raw_requirements)
 
 
-def _gather_uv_requirements(
+def _uv_requirement_command(
 	requirements_path: Path,
-	groups: set[str],
-	extras: set[str],
-	skip_dependencies: set[str],
+	*,
+	use_lock: bool,
 	base_index_url: str,
-) -> tuple[set[Requirement], set[Path]]:
-	lock_path = requirements_path.with_name("uv.lock")
-	use_lock = requirements_path.name == "pyproject.toml" and lock_path.is_file()
+) -> list[str]:
 	if use_lock:
-		command = [
+		return [
 			"uv",
 			"export",
 			"--project",
@@ -124,17 +394,40 @@ def _gather_uv_requirements(
 			"--color",
 			"never",
 		]
-	else:
-		command = [
-			"uv",
-			"pip",
-			"compile",
-			"--color",
-			"never",
-			"--index",
-			base_index_url,
-			requirements_path.as_posix(),
-		]
+
+	command = [
+		"uv",
+		"pip",
+		"compile",
+		"--color",
+		"never",
+		"--emit-index-annotation",
+	]
+	if not _is_public_pypi(base_index_url):
+		command.extend(["--default-index", base_index_url])
+	command.append(requirements_path.as_posix())
+	return command
+
+
+def _gather_uv_requirements(
+	requirements_path: Path,
+	groups: set[str],
+	extras: set[str],
+	skip_dependencies: set[str],
+	base_index_url: str,
+) -> tuple[
+	set[Requirement],
+	set[Path],
+	dict[tuple[str, str | None, str | None], str],
+]:
+	requirements_path = requirements_path.resolve()
+	lock_path = requirements_path.with_name("uv.lock")
+	use_lock = requirements_path.name == "pyproject.toml" and lock_path.is_file()
+	command = _uv_requirement_command(
+		requirements_path,
+		use_lock=use_lock,
+		base_index_url=base_index_url,
+	)
 	for group in groups:
 		command.extend(["--group", group])
 	for extra in extras:
@@ -152,7 +445,10 @@ def _gather_uv_requirements(
 			capture_output=True,
 			text=True,
 			check=False,
+			cwd=requirements_path.parent,
 		)
+	except FileNotFoundError as error:
+		raise UvUnavailableError from error
 	except OSError as error:
 		raise RuntimeError from error
 
@@ -160,10 +456,50 @@ def _gather_uv_requirements(
 		message = f"Non-zero returncode: {result.stderr}, {result.stdout}"
 		raise RuntimeError(message)
 
-	return _parse_uv_requirements(
+	parsed_requirements, editable_paths, sources = _parse_uv_requirements(
 		result.stdout,
 		skip_dependencies,
 		requirements_path.parent.resolve(),
+	)
+	if use_lock:
+		sources.update(_locked_requirement_sources(lock_path))
+	return parsed_requirements, editable_paths, sources
+
+
+def _resolution_context(
+	requirements_path: Path,
+	requirement: Requirement,
+	source_url: str | None,
+	base_index_url: str,
+) -> _UvResolutionContext:
+	directory = requirements_path.parent.resolve()
+	uv_config, config_directory = _read_uv_configuration(directory)
+	indexes = [
+		*_configured_uv_indexes(uv_config, config_directory),
+		*_environment_uv_indexes(),
+	]
+	index_args, index_environment = (
+		_index_invocation_for_source(source_url, indexes) if source_url else ((), ())
+	)
+	has_custom_index = any(not _is_public_pypi(index.url) for index in indexes)
+	prefer_artifact = bool(
+		requirement.url
+		or (source_url and not _is_public_pypi(source_url))
+		or (source_url is None and has_custom_index)
+		or not _is_public_pypi(base_index_url)
+	)
+	remote_matches_source = bool(
+		(source_url and _same_index(source_url, base_index_url))
+		or (source_url is None and not requirement.url and not _is_public_pypi(base_index_url))
+	)
+	return _UvResolutionContext(
+		directory=directory,
+		base_index_url=base_index_url,
+		source_url=source_url,
+		index_args=index_args,
+		index_environment=index_environment,
+		prefer_artifact=prefer_artifact,
+		remote_matches_source=remote_matches_source,
 	)
 
 
@@ -180,6 +516,9 @@ class PackageInfoManager:
 		self.base_pypi_url = base_pypi_url
 		self.reqs: set[Requirement] = set()
 		self.local_projects: dict[str, PackageInfo] = {}
+		self.resolution_contexts: dict[
+			tuple[str, str | None, str | None], _UvResolutionContext
+		] = {}
 
 	def resolve_requirements(
 		self,
@@ -189,16 +528,25 @@ class PackageInfoManager:
 		skip_dependencies: set[str],
 	) -> None:
 		for requirements_path in requirements_paths:
-			requirements_path_obj = Path(requirements_path)
-			self._register_local_sources(requirements_path_obj)
+			requirements_path_obj = Path(requirements_path).resolve()
 			try:
-				resolved_requirements, editable_paths = _gather_uv_requirements(
+				resolved_requirements, editable_paths, source_urls = _gather_uv_requirements(
 					requirements_path=requirements_path_obj,
 					groups=groups,
 					extras=extras,
 					skip_dependencies=skip_dependencies,
 					base_index_url=self.base_pypi_url,
 				)
+			except UvUnavailableError:
+				resolved_requirements = gather(
+					skipDependencies=skip_dependencies,
+					groups=groups,
+					extras=extras,
+					requirementsPath=requirements_path_obj,
+					base_index_url=self.base_pypi_url,
+				)
+				editable_paths = set()
+				source_urls = {}
 			except RuntimeError:
 				if requirements_path_obj.name == "pyproject.toml":
 					raise
@@ -210,12 +558,25 @@ class PackageInfoManager:
 					base_index_url=self.base_pypi_url,
 				)
 				editable_paths = set()
+				source_urls = {}
 
 			self._register_editable_projects(
 				resolved_requirements,
 				editable_paths,
 				skip_dependencies,
 			)
+			self._register_direct_local_projects(
+				resolved_requirements,
+				requirements_path_obj.parent,
+			)
+			for requirement in resolved_requirements:
+				key = _requirement_key(requirement)
+				self.resolution_contexts[key] = _resolution_context(
+					requirements_path_obj,
+					requirement,
+					source_urls.get(key),
+					self.base_pypi_url,
+				)
 			self.reqs.update(resolved_requirements)
 
 	def _register_editable_projects(
@@ -236,7 +597,6 @@ class PackageInfoManager:
 				continue
 
 			self.local_projects[package.name] = package
-			self._register_local_sources(pyproject_path)
 			if package.name in skip_names:
 				continue
 
@@ -245,45 +605,23 @@ class PackageInfoManager:
 				requirement = f"{requirement}=={package.version}"
 			resolved_requirements.add(Requirement(requirement))
 
-	def _register_local_sources(
+	def _register_direct_local_projects(
 		self,
-		pyproject_path: Path,
-		seen: set[Path] | None = None,
+		resolved_requirements: set[Requirement],
+		base_path: Path,
 	) -> None:
-		if pyproject_path.name != "pyproject.toml" or not pyproject_path.is_file():
-			return
-
-		resolved_path = pyproject_path.resolve()
-		seen = seen or set()
-		if resolved_path in seen:
-			return
-		seen.add(resolved_path)
-
-		pyproject = tomli.loads(pyproject_path.read_text(encoding="utf-8"))
-		uv_config = pyproject.get("tool", {}).get("uv", {})
-		source_paths: set[Path] = set()
-
-		for source in uv_config.get("sources", {}).values():
-			source_options = source if isinstance(source, list) else [source]
-			for source_option in source_options:
-				if not isinstance(source_option, dict) or "path" not in source_option:
-					continue
-				source_path = pyproject_path.parent / source_option["path"]
-				source_paths.add(
-					source_path
-					if source_path.name == "pyproject.toml"
-					else source_path / "pyproject.toml"
-				)
-
-		for member_pattern in uv_config.get("workspace", {}).get("members", []):
-			for member_path in pyproject_path.parent.glob(member_pattern):
-				source_paths.add(member_path / "pyproject.toml")
-
-		for source_path in source_paths:
-			source_package = self._read_project_package(source_path)
-			if source_package is not None:
-				self.local_projects[source_package.name] = source_package
-			self._register_local_sources(source_path, seen)
+		for requirement in resolved_requirements:
+			project_path = _requirement_project_path(requirement, base_path)
+			if project_path is None:
+				continue
+			pyproject_path = (
+				project_path
+				if project_path.name == "pyproject.toml"
+				else project_path / "pyproject.toml"
+			)
+			package = self._read_project_package(pyproject_path)
+			if package is not None and package.name == canonicalize_name(requirement.name):
+				self.local_projects[package.name] = package
 
 	@staticmethod
 	def _read_project_package(pyproject_path: Path) -> PackageInfo | None:
@@ -291,28 +629,48 @@ class PackageInfoManager:
 			return None
 
 		pyproject = tomli.loads(pyproject_path.read_text(encoding="utf-8"))
-		project = pyproject.get("project", {})
-		name = project.get("name")
+		tool = pyproject.get("tool", {})
+		project = (
+			pyproject.get("project")
+			or tool.get("poetry")
+			or tool.get("flit", {}).get("metadata", {})
+		)
+		if not isinstance(project, dict):
+			return None
+
+		name = project.get("name") or project.get("dist-name") or project.get("module")
 		if not name:
 			return None
 
 		license_value = project.get("license", UNKNOWN)
 		if isinstance(license_value, dict):
 			license_value = license_value.get("text", UNKNOWN)
+		if not _has_usable_license(str(license_value)):
+			license_value = from_classifiers(project.get("classifiers")) or UNKNOWN
+		license_value = normalize_license(str(license_value))
 
-		authors = project.get("authors", [])
+		authors = project.get("authors", project.get("author", []))
+		if isinstance(authors, str):
+			authors = [authors]
 		author_names = [
 			author.get("name", "") if isinstance(author, dict) else str(author)
 			for author in authors
 		]
 		project_urls = project.get("urls", {})
+		if not isinstance(project_urls, dict):
+			project_urls = {}
 
 		return PackageInfo(
 			name=canonicalize_name(name),
 			version=project.get("version"),
-			homePage=project_urls.get("Homepage") or project_urls.get("homepage"),
+			homePage=(
+				project_urls.get("Homepage")
+				or project_urls.get("homepage")
+				or project.get("homepage")
+				or project.get("home-page")
+			),
 			author=", ".join(filter(None, author_names)),
-			license=str(license_value),
+			license=license_value,
 			errorCode=0,
 		)
 
@@ -333,41 +691,74 @@ class PackageInfoManager:
 		:param Requirement package: package info to unpack
 		:return PackageInfo: Information about the package.
 		"""
-		versions: set[str | None] = {None}
+		context = self.resolution_contexts.get(_requirement_key(package))
 		package.name = canonicalize_name(package.name)
 
 		if local_project := self.local_projects.get(package.name):
-			return replace(local_project)
-
-		specifier = getattr(package, "specifier", None)
-		if specifier is not None:
-			parsed_versions = {
-				item.version
-				for item in specifier
-				if item.operator in {"==", "==="} and "*" not in item.version
-			}
-			if parsed_versions:
-				versions = parsed_versions
-
-		package.name = canonicalize_name(package.name)
+			local_package = replace(local_project)
+			if local_package.license:
+				local_package.license = normalize_license(local_package.license)
+			return local_package
 
 		base_pkg_info: PackageInfo = PackageInfo(
-			name=package.name, version=versions.pop(), errorCode=1
+			name=package.name,
+			version=_exact_requirement_version(package),
+			errorCode=1,
 		)
 
 		lpi = LocalPackageInfo(package=base_pkg_info)
-		rpi = RemotePackageInfo(pypi_api=self.base_pypi_url, package=base_pkg_info)
-		rpi.lazy_fetch()
-
-		local_matches = _versions_match(base_pkg_info.version, lpi.get_version())
+		resolved_source = context is not None and (
+			context.source_url is not None or context.prefer_artifact
+		)
+		local_matches = not resolved_source and _versions_match(
+			base_pkg_info.version,
+			lpi.get_version(),
+		)
 		local_name = lpi.get_name() if local_matches else None
 		local_license = lpi.get_license() if local_matches else None
+
+		if context is not None and context.prefer_artifact:
+			preferred_index = IndexPackageInfo(
+				package=base_pkg_info,
+				requirement=package,
+				context=context,
+			)
+			if preferred_index.get_name():
+				pkg_info = PackageInfo(
+					name=package.name,
+					version=base_pkg_info.version or preferred_index.get_version(),
+					size=preferred_index.get_size(),
+					homePage=preferred_index.get_homePage(),
+					author=preferred_index.get_author(),
+					license=preferred_index.get_license(),
+					errorCode=0,
+				)
+				if pkg_info.license:
+					pkg_info.license = normalize_license(pkg_info.license)
+				return pkg_info
+			if not context.remote_matches_source:
+				return PackageInfo(
+					name=package.name,
+					version=base_pkg_info.version,
+					errorCode=1,
+				)
+
+		rpi = RemotePackageInfo(pypi_api=self.base_pypi_url, package=base_pkg_info)
+		rpi.lazy_fetch()
 		remote_license = rpi.get_license()
 
 		needs_index = (not local_name and rpi.http_code != HTTP_OK) or not any(
 			_has_usable_license(value) for value in (local_license, remote_license)
 		)
-		ipi = IndexPackageInfo(package=base_pkg_info) if needs_index else None
+		ipi = (
+			IndexPackageInfo(
+				package=base_pkg_info,
+				requirement=package,
+				context=context,
+			)
+			if needs_index
+			else None
+		)
 		index_name = ipi.get_name() if ipi is not None else None
 		index_license = ipi.get_license() if ipi is not None else None
 		license_candidates = (local_license, index_license, remote_license)
@@ -423,7 +814,7 @@ class LocalPackageInfo:
 		self.package: PackageInfo = package
 		# email message appears to mostly conform to the protocol
 		# https://packaging.python.org/en/latest/specifications/core-metadata/#core-metadata
-		self.meta: PackageMetadata = Message()
+		self.meta: Message[str, str] | PackageMetadata = Message()
 		with contextlib.suppress(metadata.PackageNotFoundError):
 			self.meta = metadata.metadata(package.name)
 
@@ -463,9 +854,16 @@ class LocalPackageInfo:
 class IndexPackageInfo:
 	"""Handles package metadata from indexes configured for uv."""
 
-	def __init__(self, package: PackageInfo) -> None:
+	def __init__(
+		self,
+		package: PackageInfo,
+		requirement: Requirement | PackageInfo | None = None,
+		context: _UvResolutionContext | None = None,
+	) -> None:
 		self.package = package
-		self.meta: PackageMetadata = Message()
+		self.requirement = requirement
+		self.context = context
+		self.meta: Message[str, str] | PackageMetadata = Message()
 		self.fetched = False
 
 	def lazy_fetch(self) -> None:
@@ -473,8 +871,9 @@ class IndexPackageInfo:
 			return
 		self.fetched = True
 
-		requirement = self.package.name
-		if self.package.version:
+		requirement_url = getattr(self.requirement, "url", None)
+		requirement = str(self.requirement) if requirement_url else self.package.name
+		if self.package.version and not requirement_url:
 			requirement = f"{requirement}=={self.package.version}"
 
 		with tempfile.TemporaryDirectory(prefix="licensecheck-") as target:
@@ -490,14 +889,24 @@ class IndexPackageInfo:
 				":all:",
 				"--target",
 				target,
-				requirement,
 			]
+			if self.context is not None:
+				if not _is_public_pypi(self.context.base_index_url):
+					command.extend(["--default-index", self.context.base_index_url])
+				command.extend(self.context.index_args)
+			command.append(requirement)
+			run_environment = None
+			if self.context is not None and self.context.index_environment:
+				run_environment = os.environ.copy()
+				run_environment.update(dict(self.context.index_environment))
 			try:
 				result = subprocess.run(  # noqa: S603
 					command,
 					capture_output=True,
 					text=True,
 					check=False,
+					cwd=self.context.directory if self.context is not None else None,
+					env=run_environment,
 				)
 			except OSError:
 				return
@@ -547,7 +956,7 @@ class RemotePackageInfo:
 		self.pypi_api_integrity = pypi_api + "/integrity"
 		self.package = package
 		self.http_code: int = 0
-		self.resp: ProjectResponse = None
+		self.resp: ProjectResponse | None = None
 
 	def lazy_fetch(self) -> None:
 		if self.resp is None:
@@ -560,6 +969,13 @@ class RemotePackageInfo:
 
 			self.http_code = rc
 			self.resp = ProjectResponse.model_validate(raw_resp)
+
+	def _response(self) -> ProjectResponse:
+		self.lazy_fetch()
+		if self.resp is None:
+			message = "Package metadata response was not initialized"
+			raise RuntimeError(message)
+		return self.resp
 
 	def make_req(
 		self, url: str, headers: dict[str, str] | None = None
@@ -575,33 +991,29 @@ class RemotePackageInfo:
 			return -2, {}
 
 	def get_name(self) -> str:
-		self.lazy_fetch()
-		return self.resp.info.name
+		return self._response().info.name
 
 	def get_version(self) -> str:
-		self.lazy_fetch()
-		return self.resp.info.version
+		return self._response().info.version
 
 	def get_homePage(self) -> str:
-		self.lazy_fetch()
-		return self.resp.info.home_page
+		return self._response().info.home_page
 
 	def get_author(self) -> str:
-		self.lazy_fetch()
-		author_email = self.resp.info.author_email or ""
-		return self.resp.info.author or author_email.split("<")[0].strip()
+		response = self._response()
+		author_email = response.info.author_email or ""
+		return response.info.author or author_email.split("<")[0].strip()
 
 	def get_license(self) -> str:
-		self.lazy_fetch()
+		response = self._response()
 		return (
-			self.resp.info.license_expression
-			or from_classifiers(self.resp.info.classifiers)
-			or self.resp.info.license
+			response.info.license_expression
+			or from_classifiers(response.info.classifiers)
+			or response.info.license
 		)
 
 	def get_size(self) -> int | None:
-		self.lazy_fetch()
-		urls = self.resp.urls
+		urls = self._response().urls
 		return urls[-1].size if len(urls) > 0 else None
 
 

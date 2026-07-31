@@ -140,6 +140,224 @@ License-Expression: LicenseRef-Example-Proprietary
 	]
 
 
+def test_resolve_requirements_uses_project_directory_and_default_index(
+	tmp_path: Path,
+	monkeypatch: pytest.MonkeyPatch,
+) -> None:
+	pyproject_path = write_pyproject(
+		tmp_path / "project",
+		"""
+[project]
+name = "project"
+version = "1.0.0"
+dependencies = ["private-package"]
+""",
+	)
+	calls: list[tuple[list[str], dict[str, object]]] = []
+
+	def fake_run(command: list[str], **kwargs: object) -> CompletedProcess[str]:
+		calls.append((command, kwargs))
+		return CompletedProcess(command, 0, "private-package==1.2.3\n", "")
+
+	monkeypatch.setattr("licensecheck.packageinforesolver.subprocess.run", fake_run)
+	manager = PackageInfoManager("https://packages.example/simple")
+	manager.resolve_requirements({str(pyproject_path)}, set(), set(), set())
+
+	command, kwargs = calls[0]
+	assert command[command.index("--default-index") + 1] == "https://packages.example/simple"
+	assert "--index" not in command
+	assert kwargs["cwd"] == pyproject_path.parent
+
+
+def test_package_manager_reads_metadata_from_resolved_private_source(
+	package_info_manager: PackageInfoManager,
+	tmp_path: Path,
+	monkeypatch: pytest.MonkeyPatch,
+) -> None:
+	pyproject_path = write_pyproject(
+		tmp_path / "project",
+		"""
+[project]
+name = "project"
+version = "1.0.0"
+dependencies = ["private-package==1.2.3"]
+
+[[tool.uv.index]]
+name = "private"
+url = "https://packages.example/simple"
+explicit = true
+
+[tool.uv.sources]
+private-package = { index = "private" }
+""",
+	)
+	commands: list[tuple[list[str], object]] = []
+
+	def fake_run(command: list[str], **kwargs: object) -> CompletedProcess[str]:
+		commands.append((command, kwargs.get("cwd")))
+		if command[:3] == ["uv", "pip", "compile"]:
+			return CompletedProcess(
+				command,
+				0,
+				"""private-package==1.2.3
+    # via project
+    # from https://packages.example/simple
+""",
+				"",
+			)
+
+		target = Path(command[command.index("--target") + 1])
+		metadata_path = target / "private_package-1.2.3.dist-info" / "METADATA"
+		metadata_path.parent.mkdir()
+		metadata_path.write_text(
+			"""
+Metadata-Version: 2.4
+Name: private-package
+Version: 1.2.3
+License-Expression: LicenseRef-Private-Proprietary
+""".strip(),
+			encoding="utf-8",
+		)
+		return CompletedProcess(command, 0, "", "")
+
+	def fail_public_lookup(*_args: object, **_kwargs: object) -> tuple[int, dict[str, object]]:
+		pytest.fail("public metadata must not replace the resolved private artifact")
+
+	monkeypatch.setattr("licensecheck.packageinforesolver.subprocess.run", fake_run)
+	monkeypatch.setattr(RemotePackageInfo, "make_req", fail_public_lookup)
+
+	package_info_manager.resolve_requirements({str(pyproject_path)}, set(), set(), set())
+	package = package_info_manager.getPackages().pop()
+
+	assert package.license == "LicenseRef-Private-Proprietary"
+	install_command, install_cwd = commands[1]
+	assert install_command[install_command.index("--index") + 1] == (
+		"private=https://packages.example/simple"
+	)
+	assert install_cwd == pyproject_path.parent
+
+
+def test_private_index_credentials_are_not_exposed_in_command(
+	package_info_manager: PackageInfoManager,
+	tmp_path: Path,
+	monkeypatch: pytest.MonkeyPatch,
+) -> None:
+	private_index = "https://user:secret@packages.example/simple"
+	pyproject_path = write_pyproject(
+		tmp_path,
+		f"""
+[project]
+name = "project"
+version = "1.0.0"
+dependencies = ["private-package==1.2.3"]
+
+[tool.uv]
+index-url = "{private_index}"
+""",
+	)
+	install_call: tuple[list[str], dict[str, object]] | None = None
+
+	def fake_run(command: list[str], **kwargs: object) -> CompletedProcess[str]:
+		nonlocal install_call
+		if command[:3] == ["uv", "pip", "compile"]:
+			return CompletedProcess(
+				command,
+				0,
+				"private-package==1.2.3\n    # from https://packages.example/simple\n",
+				"",
+			)
+
+		install_call = command, kwargs
+		target = Path(command[command.index("--target") + 1])
+		metadata_path = target / "private_package-1.2.3.dist-info" / "METADATA"
+		metadata_path.parent.mkdir()
+		metadata_path.write_text(
+			"""
+Metadata-Version: 2.4
+Name: private-package
+Version: 1.2.3
+License-Expression: LicenseRef-Private-Proprietary
+""".strip(),
+			encoding="utf-8",
+		)
+		return CompletedProcess(command, 0, "", "")
+
+	monkeypatch.setattr("licensecheck.packageinforesolver.subprocess.run", fake_run)
+	monkeypatch.setattr(
+		RemotePackageInfo,
+		"make_req",
+		lambda *_args, **_kwargs: pytest.fail("the resolved private artifact must be used"),
+	)
+
+	package_info_manager.resolve_requirements({str(pyproject_path)}, set(), set(), set())
+	package = package_info_manager.getPackages().pop()
+
+	assert package.license == "LicenseRef-Private-Proprietary"
+	assert install_call is not None
+	install_command, install_kwargs = install_call
+	assert "secret" not in " ".join(install_command)
+	install_environment = install_kwargs["env"]
+	assert isinstance(install_environment, dict)
+	assert install_environment["UV_INDEX"] == private_index
+
+
+def test_resolved_public_source_ignores_installed_private_homonym(
+	package_info_manager: PackageInfoManager,
+	tmp_path: Path,
+	monkeypatch: pytest.MonkeyPatch,
+) -> None:
+	pyproject_path = write_pyproject(
+		tmp_path,
+		"""
+[project]
+name = "project"
+version = "1.0.0"
+dependencies = ["homonym==1.2.3"]
+""",
+	)
+	installed_metadata = Message()
+	installed_metadata["Name"] = "homonym"
+	installed_metadata["Version"] = "1.2.3"
+	installed_metadata["License-Expression"] = "LicenseRef-Private-Proprietary"
+
+	def fake_run(command: list[str], **_kwargs: object) -> CompletedProcess[str]:
+		if command[:3] != ["uv", "pip", "compile"]:
+			pytest.fail("public metadata already declares a usable license")
+		return CompletedProcess(
+			command,
+			0,
+			"homonym==1.2.3\n    # from https://pypi.org/simple\n",
+			"",
+		)
+
+	def fake_make_req(
+		_self: RemotePackageInfo,
+		url: str,
+		headers: dict[str, str] | None = None,
+	) -> tuple[int, dict[str, object]]:
+		del url, headers
+		return 200, {
+			"info": {
+				"name": "homonym",
+				"version": "1.2.3",
+				"license_expression": "MIT",
+			}
+		}
+
+	monkeypatch.setattr("licensecheck.packageinforesolver.subprocess.run", fake_run)
+	monkeypatch.setattr(
+		"licensecheck.packageinforesolver.metadata.metadata",
+		lambda _name: installed_metadata,
+	)
+	monkeypatch.setattr(RemotePackageInfo, "make_req", fake_make_req)
+
+	package_info_manager.resolve_requirements({str(pyproject_path)}, set(), set(), set())
+	package = package_info_manager.getPackages().pop()
+
+	assert package.version == "1.2.3"
+	assert package.license == "MIT"
+
+
 def test_package_manager_uses_private_index_when_pypi_is_missing(
 	package_info_manager: PackageInfoManager,
 	monkeypatch: pytest.MonkeyPatch,
@@ -287,7 +505,7 @@ def test_getPackagePypiLocalNotFound() -> None:
 
 
 def test_getPackages(package_info_manager: PackageInfoManager) -> None:
-	package_info_manager.reqs = {aux_packageinfo("requests")}
+	package_info_manager.reqs = {Requirement("requests")}
 	packages = package_info_manager.getPackages()
 	package = packages.pop()
 	assert package.name == "requests"
@@ -296,7 +514,7 @@ def test_getPackages(package_info_manager: PackageInfoManager) -> None:
 
 
 def test_getPackagesNotFound(package_info_manager: PackageInfoManager) -> None:
-	package_info_manager.reqs = {aux_packageinfo("this_package_does_not_exist")}
+	package_info_manager.reqs = {Requirement("this_package_does_not_exist")}
 
 	packages = package_info_manager.getPackages()
 	package = packages.pop()
@@ -337,6 +555,88 @@ def test_getModuleSize() -> None:
 )
 def test_normalize_license(lice: str, normalized: str) -> None:
 	assert normalize_license(lice) == normalized
+
+
+@pytest.mark.parametrize(
+	("contents", "name", "author", "homepage"),
+	[
+		(
+			"""
+[tool.poetry]
+name = "poetry-local"
+version = "1.2.3"
+license = "MIT"
+authors = ["Poetry Author <author@example.com>"]
+homepage = "https://poetry.example"
+""",
+			"poetry-local",
+			"Poetry Author <author@example.com>",
+			"https://poetry.example",
+		),
+		(
+			"""
+[tool.flit.metadata]
+module = "flit_local"
+dist-name = "flit-local"
+version = "1.2.3"
+license = "MIT"
+author = "Flit Author"
+home-page = "https://flit.example"
+""",
+			"flit-local",
+			"Flit Author",
+			"https://flit.example",
+		),
+	],
+)
+def test_read_project_package_supports_legacy_metadata(
+	tmp_path: Path,
+	contents: str,
+	name: str,
+	author: str,
+	homepage: str,
+) -> None:
+	pyproject_path = write_pyproject(tmp_path, contents)
+
+	package = PackageInfoManager._read_project_package(pyproject_path)
+
+	assert package is not None
+	assert package.name == name
+	assert package.version == "1.2.3"
+	assert package.license == "MIT"
+	assert package.author == author
+	assert package.homePage == homepage
+
+
+@pytest.mark.parametrize(
+	("license_metadata", "expected"),
+	[
+		('license = "MIT OR GPL-3.0-only"', "GPL-3.0-only;; MIT"),
+		(
+			'classifiers = ["License :: OSI Approved :: MIT License"]',
+			"MIT License",
+		),
+	],
+)
+def test_read_project_package_normalizes_license_metadata(
+	tmp_path: Path,
+	license_metadata: str,
+	expected: str,
+) -> None:
+	pyproject_path = write_pyproject(
+		tmp_path,
+		f"""
+[project]
+name = "local-package"
+version = "1.2.3"
+{license_metadata}
+""",
+	)
+
+	package = PackageInfoManager._read_project_package(pyproject_path)
+
+	assert package is not None
+	assert package.license == expected
 
 
 def test_unpinned_requirement_does_not_crash(package_info_manager: PackageInfoManager) -> None:
@@ -603,6 +903,15 @@ def test_resolve_requirements_does_not_skip_inactive_editable_source(
 	tmp_path: Path,
 	monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+	write_pyproject(
+		tmp_path / "local-idna",
+		"""
+[project]
+name = "idna"
+version = "999"
+license = "LicenseRef-Local-Proprietary"
+""",
+	)
 	pyproject_path = write_pyproject(
 		tmp_path / "project",
 		"""
@@ -630,6 +939,22 @@ idna = {
 
 	monkeypatch.setattr("licensecheck.packageinforesolver.subprocess.run", fake_run)
 
+	def fake_make_req(
+		_self: RemotePackageInfo,
+		url: str,
+		headers: dict[str, str] | None = None,
+	) -> tuple[int, dict[str, object]]:
+		del url, headers
+		return 200, {
+			"info": {
+				"name": "idna",
+				"version": "3.10",
+				"license_expression": "BSD-3-Clause",
+			}
+		}
+
+	monkeypatch.setattr(RemotePackageInfo, "make_req", fake_make_req)
+
 	package_info_manager.resolve_requirements(
 		requirements_paths={str(pyproject_path)},
 		groups=set(),
@@ -638,6 +963,10 @@ idna = {
 	)
 
 	assert {str(requirement) for requirement in package_info_manager.reqs} == {"idna==3.10"}
+	package = package_info_manager.getPackages().pop()
+	assert package.version == "3.10"
+	assert package.license == "BSD-3-Clause"
+	assert "idna" not in package_info_manager.local_projects
 
 
 def test_resolve_requirements_uses_uv_prerelease_setting(
@@ -983,3 +1312,38 @@ dependencies = ["dependency"]
 			extras=set(),
 			skip_dependencies=set(),
 		)
+
+
+def test_resolve_requirements_falls_back_when_uv_is_unavailable(
+	package_info_manager: PackageInfoManager,
+	tmp_path: Path,
+	monkeypatch: pytest.MonkeyPatch,
+) -> None:
+	pyproject_path = write_pyproject(
+		tmp_path,
+		"""
+[project]
+name = "project"
+version = "1.0.0"
+dependencies = ["dependency"]
+""",
+	)
+	fallback_calls: list[Path] = []
+
+	def missing_uv(*_args: object, **_kwargs: object) -> CompletedProcess[str]:
+		message = "uv"
+		raise FileNotFoundError(message)
+
+	def fake_gather(**kwargs: object) -> set[Requirement]:
+		requirements_path = kwargs["requirementsPath"]
+		assert isinstance(requirements_path, Path)
+		fallback_calls.append(requirements_path)
+		return {Requirement("dependency==1.2.3")}
+
+	monkeypatch.setattr("licensecheck.packageinforesolver.subprocess.run", missing_uv)
+	monkeypatch.setattr("licensecheck.packageinforesolver.gather", fake_gather)
+
+	package_info_manager.resolve_requirements({str(pyproject_path)}, set(), set(), set())
+
+	assert fallback_calls == [pyproject_path]
+	assert {str(requirement) for requirement in package_info_manager.reqs} == {"dependency==1.2.3"}
