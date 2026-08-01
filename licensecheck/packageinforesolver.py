@@ -374,7 +374,6 @@ def _editable_project_path(line: str, base_path: Path) -> Path | None:
 	if parsed_url.scheme and parsed_url.scheme != "file":
 		return None
 
-	# `url2pathname` already percent-decodes, so decoding again would corrupt literal "%" paths.
 	if parsed_url.scheme == "file":
 		path = Path(url2pathname(parsed_url.path))
 	else:
