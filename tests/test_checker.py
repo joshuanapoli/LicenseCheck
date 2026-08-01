@@ -130,7 +130,12 @@ def test_matching_custom_license_reference_is_compatible(
 
 
 @pytest.mark.parametrize(
-	("dependency_license", "allowed_license_refs", "fail_licenses", "expected_incompatible"),
+	(
+		"dependency_license",
+		"allowed_license_references",
+		"fail_licenses",
+		"expected_incompatible",
+	),
 	[
 		(
 			"LicenseRef-NVIDIA-Proprietary",
@@ -159,10 +164,10 @@ def test_matching_custom_license_reference_is_compatible(
 		),
 	],
 )
-def test_allowed_license_refs_match_exact_raw_references(
+def test_allowed_license_references_match_exact_raw_references(
 	mock_package_info_manager: PackageInfoManager,
 	dependency_license: str,
-	allowed_license_refs: set[str],
+	allowed_license_references: set[str],
 	fail_licenses: set[str] | None,
 	*,
 	expected_incompatible: bool,
@@ -177,7 +182,7 @@ def test_allowed_license_refs_match_exact_raw_references(
 		extras=set(),
 		this_license=License.PROPRIETARY,
 		package_info_manager=mock_package_info_manager,
-		allowed_license_refs=allowed_license_refs,
+		allowed_license_references=allowed_license_references,
 		fail_licenses=fail_licenses,
 	)
 

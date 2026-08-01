@@ -30,10 +30,12 @@ def _matches_custom_license(this_license_text: str | None, dependency_license: s
 	return project_license.startswith("licenseref-") and project_license == dependency_license
 
 
-def _matches_allowed_license_ref(allowed_license_refs: set[str], dependency_license: str) -> bool:
+def _matches_allowed_license_reference(
+	allowed_license_references: set[str], dependency_license: str
+) -> bool:
 	dependency_license = dependency_license.strip().casefold()
 	return dependency_license.startswith("licenseref-") and dependency_license in {
-		license_ref.strip().casefold() for license_ref in allowed_license_refs
+		license_ref.strip().casefold() for license_ref in allowed_license_references
 	}
 
 
@@ -47,7 +49,7 @@ def check(
 	ignore_packages: set[str] | None = None,
 	fail_packages: set[str] | None = None,
 	ignore_licenses: set[str] | None = None,
-	allowed_license_refs: set[str] | None = None,
+	allowed_license_references: set[str] | None = None,
 	fail_licenses: set[str] | None = None,
 	only_licenses: set[str] | None = None,
 	skip_dependencies: set[str] | None = None,
@@ -56,7 +58,7 @@ def check(
 	ignore_packages = ignore_packages or set()
 	fail_packages = fail_packages or set()
 	ignore_licenses = ignore_licenses or set()
-	allowed_license_refs = allowed_license_refs or set()
+	allowed_license_references = allowed_license_references or set()
 	fail_licenses = fail_licenses or set()
 	only_licenses = only_licenses or set()
 	skip_dependencies = skip_dependencies or set()
@@ -88,7 +90,7 @@ def check(
 			pass  # package.licenseCompat = False
 		elif license_matrix.licenseType(str(package.license), ignore_licenses) & failLicensesType:
 			pass
-		elif _matches_allowed_license_ref(allowed_license_refs, str(package.license)):
+		elif _matches_allowed_license_reference(allowed_license_references, str(package.license)):
 			package.licenseCompat = True
 		elif _matches_custom_license(this_license_text, str(package.license)):
 			package.licenseCompat = True

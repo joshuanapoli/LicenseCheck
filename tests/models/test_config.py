@@ -21,7 +21,7 @@ file = ""                     # Output file (leave empty for stdout)
 ignore_packages = []          # Packages/dependencies to ignore
 fail_packages = []            # Packages/dependencies that cause failure
 ignore_licenses = []          # Licenses to ignore
-allowed_license_refs = []     # Exact LicenseRef identifiers to accept
+allowed_license_references = [] # Exact LicenseRef identifiers to accept
 fail_licenses = []            # Licenses that cause failure
 only_licenses = []            # Allowed licenses (all others will fail)
 skip_dependencies = []        # Dependencies to skip (compatibility = True)
@@ -45,7 +45,7 @@ license = "mit"               # Specify the project license explicitly
 ignore_packages = []          # Packages/dependencies to ignore
 fail_packages = []            # Packages/dependencies that cause failure
 ignore_licenses = []          # Licenses to ignore
-allowed_license_refs = []     # Exact LicenseRef identifiers to accept
+allowed_license_references = [] # Exact LicenseRef identifiers to accept
 fail_licenses = []            # Licenses that cause failure
 only_licenses = []            # Allowed licenses (all others will fail)
 skip_dependencies = []        # Dependencies to skip (compatibility = True)
