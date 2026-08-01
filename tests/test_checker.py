@@ -127,3 +127,58 @@ def test_matching_custom_license_reference_is_compatible(
 	)
 
 	assert incompatible == expected_incompatible, packages
+
+
+@pytest.mark.parametrize(
+	("dependency_license", "allowed_license_refs", "fail_licenses", "expected_incompatible"),
+	[
+		(
+			"LicenseRef-NVIDIA-Proprietary",
+			{"LicenseRef-NVIDIA-Proprietary"},
+			None,
+			False,
+		),
+		(
+			"licenseref-nvidia-proprietary",
+			{"LicenseRef-NVIDIA-Proprietary"},
+			None,
+			False,
+		),
+		(
+			"LicenseRef-Other-Proprietary",
+			{"LicenseRef-NVIDIA-Proprietary"},
+			None,
+			True,
+		),
+		("PROPRIETARY", {"PROPRIETARY"}, None, True),
+		(
+			"LicenseRef-NVIDIA-Proprietary",
+			{"LicenseRef-NVIDIA-Proprietary"},
+			{"PROPRIETARY"},
+			True,
+		),
+	],
+)
+def test_allowed_license_refs_match_exact_raw_references(
+	mock_package_info_manager: PackageInfoManager,
+	dependency_license: str,
+	allowed_license_refs: set[str],
+	fail_licenses: set[str] | None,
+	*,
+	expected_incompatible: bool,
+) -> None:
+	mock_package_info_manager.getPackages.return_value = {
+		PackageInfo(name="private-package", version="1.2.3", license=dependency_license)
+	}
+
+	incompatible, packages = check(
+		requirements_paths={"requirements.txt"},
+		groups=set(),
+		extras=set(),
+		this_license=License.PROPRIETARY,
+		package_info_manager=mock_package_info_manager,
+		allowed_license_refs=allowed_license_refs,
+		fail_licenses=fail_licenses,
+	)
+
+	assert incompatible == expected_incompatible, packages

@@ -25,6 +25,7 @@ class LC_Config(DefaultOnNoneModel):
 	ignore_packages: set[str] = field(default_factory=set)
 	fail_packages: set[str] = field(default_factory=set)
 	ignore_licenses: set[str] = field(default_factory=set)
+	allowed_license_refs: set[str] = field(default_factory=set)
 	fail_licenses: set[str] = field(default_factory=set)
 	only_licenses: set[str] = field(default_factory=set)
 	skip_dependencies: set[str] = field(default_factory=set)

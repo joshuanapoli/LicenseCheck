@@ -86,6 +86,11 @@ def cli() -> None:  # pragma: no cover
 		nargs="+",
 	)
 	parser.add_argument(
+		"--allowed-license-refs",
+		help="set of exact LicenseRef-* identifiers to accept",
+		nargs="+",
+	)
+	parser.add_argument(
 		"--fail-licenses",
 		help="set of licenses to fail (compat=False)",
 		nargs="+",
@@ -175,6 +180,7 @@ def main(licensecheckConf: LC_Config) -> ExitCode:
 		ignore_packages=licensecheckConf.ignore_packages,
 		fail_packages=licensecheckConf.fail_packages,
 		ignore_licenses=licensecheckConf.ignore_licenses,
+		allowed_license_refs=licensecheckConf.allowed_license_refs,
 		fail_licenses=licensecheckConf.fail_licenses,
 		only_licenses=licensecheckConf.only_licenses,
 		skip_dependencies=licensecheckConf.skip_dependencies,

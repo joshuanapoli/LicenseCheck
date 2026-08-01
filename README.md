@@ -213,6 +213,7 @@ file = ""                     # Output file (leave empty for stdout)
 ignore_packages = []          # Names, name==version entries, or globs to ignore
 fail_packages = []            # Names, name==version entries, or globs that fail
 ignore_licenses = []          # Licenses to ignore
+allowed_license_refs = []     # Exact LicenseRef identifiers to accept
 fail_licenses = []            # Licenses that cause failure
 only_licenses = []            # Allowed licenses (all others will fail)
 skip_dependencies = []        # Dependencies to skip (compatibility = True)
@@ -237,6 +238,7 @@ zero = false                  # Return non-zero exit code for incompatible licen
       "groups": [],
       "hide_output_parameters": [],
       "ignore_licenses": [],
+      "allowed_license_refs": [],
       "ignore_packages": [],
       "license": "mit",
       "only_licenses": [],
