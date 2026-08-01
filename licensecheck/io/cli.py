@@ -170,6 +170,7 @@ def main(licensecheckConf: LC_Config) -> ExitCode:
 		groups=licensecheckConf.groups,
 		extras=licensecheckConf.extras,
 		this_license=this_license,
+		this_license_text=this_license_text,
 		package_info_manager=package_info_manager,
 		ignore_packages=licensecheckConf.ignore_packages,
 		fail_packages=licensecheckConf.fail_packages,

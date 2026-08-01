@@ -22,12 +22,21 @@ def _package_matches(package: PackageInfo, patterns: set[str]) -> bool:
 	)
 
 
+def _matches_custom_license(this_license_text: str | None, dependency_license: str) -> bool:
+	if not this_license_text:
+		return False
+	project_license = this_license_text.strip().casefold()
+	dependency_license = dependency_license.strip().casefold()
+	return project_license.startswith("licenseref-") and project_license == dependency_license
+
+
 def check(
 	requirements_paths: set[str],
 	groups: set[str],
 	extras: set[str],
 	this_license: License,
 	package_info_manager: PackageInfoManager,
+	this_license_text: str | None = None,
 	ignore_packages: set[str] | None = None,
 	fail_packages: set[str] | None = None,
 	ignore_licenses: set[str] | None = None,
@@ -68,6 +77,8 @@ def check(
 			package.licenseCompat = True
 		elif _package_matches(package, fail_packages):
 			pass  # package.licenseCompat = False
+		elif _matches_custom_license(this_license_text, str(package.license)):
+			package.licenseCompat = True
 		# Else get compat with myLice
 		else:
 			package.licenseCompat = license_matrix.depCompatWMyLice(

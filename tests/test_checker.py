@@ -96,3 +96,34 @@ def test_ignore_packages_can_match_versions(
 	)
 
 	assert incompatible == expected_incompatible, packages
+
+
+@pytest.mark.parametrize(
+	("dependency_license", "expected_incompatible"),
+	[
+		("LicenseRef-CVector-Proprietary", False),
+		("licenseref-cvector-proprietary", False),
+		("LicenseRef-Other-Proprietary", True),
+		("PROPRIETARY", True),
+	],
+)
+def test_matching_custom_license_reference_is_compatible(
+	mock_package_info_manager: PackageInfoManager,
+	dependency_license: str,
+	*,
+	expected_incompatible: bool,
+) -> None:
+	mock_package_info_manager.getPackages.return_value = {
+		PackageInfo(name="private-package", version="1.2.3", license=dependency_license)
+	}
+
+	incompatible, packages = check(
+		requirements_paths={"requirements.txt"},
+		groups=set(),
+		extras=set(),
+		this_license=License.PROPRIETARY,
+		this_license_text="LicenseRef-CVector-Proprietary",
+		package_info_manager=mock_package_info_manager,
+	)
+
+	assert incompatible == expected_incompatible, packages
