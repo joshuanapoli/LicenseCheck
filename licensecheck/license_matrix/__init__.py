@@ -52,6 +52,13 @@ THISDIR = Path(__file__).resolve().parent
 with Path(THISDIR / "matrix.csv").open(mode="r", newline="", encoding="utf-8") as csv_file:
 	LICENSE_MATRIX: list[list[str]] = list[list[str]](csv.reader(csv_file))
 
+# Look the matrix up by license name. The csv column/row order does not match the
+# declaration order of the License enum, so positional indexing silently misreads rows.
+LICENSE_MATRIX_ROWS: dict[str, list[str]] = {row[0]: row for row in LICENSE_MATRIX[1:]}
+LICENSE_MATRIX_COLUMNS: dict[str, int] = {
+	name: index for index, name in enumerate(LICENSE_MATRIX[0])
+}
+
 
 termToLicenseData = {
 	"UNKNOWN": L.UNKNOWN,
@@ -225,9 +232,7 @@ def liceCompat(
 		return False
 
 	try:
-		licenses = list(L)
-		row, col = licenses.index(myLicense) + 1, licenses.index(lice) + 1
-		return LICENSE_MATRIX[row][col] == "1"
-	except (IndexError, ValueError):
+		return LICENSE_MATRIX_ROWS[myLicense.name][LICENSE_MATRIX_COLUMNS[lice.name]] == "1"
+	except (IndexError, KeyError):
 		logger.warning(f"Licenses {myLicense} and {lice} cannot be compared")
 		return False

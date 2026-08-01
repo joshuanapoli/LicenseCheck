@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import configparser
 import contextlib
+import functools
 import os
 import re
 import subprocess
@@ -15,7 +16,7 @@ from importlib import metadata
 from importlib.metadata._meta import PackageMetadata
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import urlparse
 from urllib.request import url2pathname
 
 import license_expression
@@ -26,6 +27,7 @@ from boolean.boolean import Expression
 from depgather.models.pypijson import ProjectResponse
 from depgather.parse import gather
 from license_expression import Licensing
+from loguru import logger
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
@@ -40,6 +42,10 @@ HTTP_OK = 200
 EXPLICIT_LICENSE_ALIASES = {
 	"Apache 2.0": "Apache-2.0",
 }
+
+# uv can block indefinitely (for example prompting for index credentials), so cap each call
+UV_RESOLVE_TIMEOUT_SECONDS = 900
+UV_ARTIFACT_TIMEOUT_SECONDS = 600
 
 
 class UvUnavailableError(RuntimeError):
@@ -72,18 +78,29 @@ def _has_usable_license(license_value: str | None) -> bool:
 	)
 
 
+@functools.lru_cache(maxsize=1)
+def _spdx_licensing() -> Licensing:
+	"""
+	Build the SPDX licensing index once.
+
+	``license_expression.get_spdx_licensing`` re-reads and re-parses a large vendored JSON
+	index on every call, so it must not be called per package.
+	"""
+	return license_expression.get_spdx_licensing()
+
+
 def _recognizable_explicit_license(license_value: str | None) -> str | None:
 	if not _has_usable_license(license_value):
 		return None
 
 	value = str(license_value).strip()
-	if re.fullmatch(r"LicenseRef-[A-Za-z0-9.-]+", value):
+	if re.fullmatch(r"LicenseRef-[A-Za-z0-9.-]+", value, flags=re.IGNORECASE):
 		return value
 	if value in EXPLICIT_LICENSE_ALIASES:
 		return EXPLICIT_LICENSE_ALIASES[value]
 
 	with contextlib.suppress(license_expression.ExpressionError):
-		license_expression.get_spdx_licensing().parse(value, validate=True)
+		_spdx_licensing().parse(value, validate=True)
 		return value
 	return None
 
@@ -134,12 +151,13 @@ def _requirement_key(
 	)
 
 
+@functools.cache
 def _normalized_index_url(url: str) -> str:
 	parsed = urlparse(url)
 	if not parsed.scheme and Path(url).is_absolute():
 		return Path(url).resolve().as_uri().rstrip("/")
 	if parsed.scheme == "file":
-		return Path(url2pathname(unquote(parsed.path))).resolve().as_uri().rstrip("/")
+		return Path(url2pathname(parsed.path)).resolve().as_uri().rstrip("/")
 	normalized = url.rstrip("/").removesuffix("/simple")
 	parsed = urlparse(normalized)
 	if parsed.hostname:
@@ -220,7 +238,6 @@ def _configured_uv_indexes(
 	uv_config: dict[str, Any],
 	config_directory: Path,
 ) -> list[_UvIndex]:
-
 	raw_indexes = uv_config.get("index", [])
 	if isinstance(raw_indexes, dict):
 		raw_indexes = [raw_indexes]
@@ -357,8 +374,12 @@ def _editable_project_path(line: str, base_path: Path) -> Path | None:
 	if parsed_url.scheme and parsed_url.scheme != "file":
 		return None
 
-	path_value = parsed_url.path if parsed_url.scheme == "file" else target
-	path = Path(url2pathname(unquote(path_value)))
+	# `url2pathname` already percent-decodes, so decoding again would corrupt literal "%" paths.
+	if parsed_url.scheme == "file":
+		path = Path(url2pathname(parsed_url.path))
+	else:
+		# A bare path is not a URL; only strip a trailing "#egg=" style fragment.
+		path = Path(target.split("#", 1)[0])
 	if not path.is_absolute():
 		path = base_path / path
 	return path.resolve()
@@ -371,7 +392,7 @@ def _requirement_project_path(requirement: Requirement, base_path: Path) -> Path
 	if parsed_url.scheme != "file":
 		return None
 
-	path = Path(url2pathname(unquote(parsed_url.path)))
+	path = Path(url2pathname(parsed_url.path))
 	if not path.is_absolute():
 		path = base_path / path
 	return path.resolve()
@@ -479,9 +500,14 @@ def _gather_uv_requirements(
 			text=True,
 			check=False,
 			cwd=requirements_path.parent,
+			stdin=subprocess.DEVNULL,
+			timeout=UV_RESOLVE_TIMEOUT_SECONDS,
 		)
 	except FileNotFoundError as error:
 		raise UvUnavailableError from error
+	except subprocess.TimeoutExpired as error:
+		message = f"Timed out after {UV_RESOLVE_TIMEOUT_SECONDS}s running: {' '.join(command)}"
+		raise RuntimeError(message) from error
 	except OSError as error:
 		raise RuntimeError from error
 
@@ -499,18 +525,27 @@ def _gather_uv_requirements(
 	return parsed_requirements, editable_paths, sources
 
 
+def _project_indexes(directory: Path) -> list[_UvIndex]:
+	"""
+	Collect the uv indexes that apply to ``directory``.
+
+	This reads configuration files and the environment, so it is resolved once per
+	requirements file rather than once per requirement.
+	"""
+	uv_config, config_directory = _read_uv_configuration(directory)
+	return [
+		*_configured_uv_indexes(uv_config, config_directory),
+		*_environment_uv_indexes(),
+	]
+
+
 def _resolution_context(
-	requirements_path: Path,
+	directory: Path,
+	indexes: list[_UvIndex],
 	requirement: Requirement,
 	source_url: str | None,
 	base_index_url: str,
 ) -> _UvResolutionContext:
-	directory = requirements_path.parent.resolve()
-	uv_config, config_directory = _read_uv_configuration(directory)
-	indexes = [
-		*_configured_uv_indexes(uv_config, config_directory),
-		*_environment_uv_indexes(),
-	]
 	index_args, index_environment = (
 		_index_invocation_for_source(source_url, indexes) if source_url else ((), ())
 	)
@@ -570,19 +605,16 @@ class PackageInfoManager:
 					skip_dependencies=skip_dependencies,
 					base_index_url=self.base_pypi_url,
 				)
-			except UvUnavailableError:
-				resolved_requirements = gather(
-					skipDependencies=skip_dependencies,
-					groups=groups,
-					extras=extras,
-					requirementsPath=requirements_path_obj,
-					base_index_url=self.base_pypi_url,
-				)
-				editable_paths = set()
-				source_urls = {}
-			except RuntimeError:
-				if requirements_path_obj.name == "pyproject.toml":
+			except RuntimeError as error:
+				# UvUnavailableError is a RuntimeError; only a genuine resolution failure
+				# for a pyproject.toml is fatal.
+				if not isinstance(error, UvUnavailableError) and (
+					requirements_path_obj.name == "pyproject.toml"
+				):
 					raise
+				logger.warning(
+					f"Falling back to the legacy resolver for {requirements_path_obj}: {error}"
+				)
 				resolved_requirements = gather(
 					skipDependencies=skip_dependencies,
 					groups=groups,
@@ -602,10 +634,13 @@ class PackageInfoManager:
 				resolved_requirements,
 				requirements_path_obj.parent,
 			)
+			directory = requirements_path_obj.parent.resolve()
+			indexes = _project_indexes(directory)
 			for requirement in resolved_requirements:
 				key = _requirement_key(requirement)
 				self.resolution_contexts[key] = _resolution_context(
-					requirements_path_obj,
+					directory,
+					indexes,
 					requirement,
 					source_urls.get(key),
 					self.base_pypi_url,
@@ -750,6 +785,7 @@ class PackageInfoManager:
 		local_name = lpi.get_name() if local_matches else None
 		local_license = lpi.get_license() if local_matches else None
 
+		preferred_index: IndexPackageInfo | None = None
 		if context is not None and context.prefer_artifact:
 			preferred_index = IndexPackageInfo(
 				package=base_pkg_info,
@@ -760,7 +796,6 @@ class PackageInfoManager:
 				pkg_info = PackageInfo(
 					name=package.name,
 					version=base_pkg_info.version or preferred_index.get_version(),
-					size=preferred_index.get_size(),
 					homePage=preferred_index.get_homePage(),
 					author=preferred_index.get_author(),
 					license=preferred_index.get_license(),
@@ -783,15 +818,14 @@ class PackageInfoManager:
 		needs_index = (not local_name and rpi.http_code != HTTP_OK) or not any(
 			_has_usable_license(value) for value in (local_license, remote_license)
 		)
-		ipi = (
-			IndexPackageInfo(
+		# Reuse the artifact fetch already attempted above rather than re-running `uv pip install`
+		ipi = preferred_index
+		if ipi is None and needs_index:
+			ipi = IndexPackageInfo(
 				package=base_pkg_info,
 				requirement=package,
 				context=context,
 			)
-			if needs_index
-			else None
-		)
 		index_name = ipi.get_name() if ipi is not None else None
 		index_license = ipi.get_license() if ipi is not None else None
 		license_candidates = (local_license, index_license, remote_license)
@@ -940,11 +974,17 @@ class IndexPackageInfo:
 					check=False,
 					cwd=self.context.directory if self.context is not None else None,
 					env=run_environment,
+					stdin=subprocess.DEVNULL,
+					timeout=UV_ARTIFACT_TIMEOUT_SECONDS,
 				)
-			except OSError:
+			except (OSError, subprocess.TimeoutExpired) as error:
+				logger.warning(f"Could not fetch the artifact for {self.package.name}: {error}")
 				return
 
 			if result.returncode != 0:
+				logger.warning(
+					f"Could not fetch the artifact for {self.package.name}: {result.stderr}"
+				)
 				return
 
 			for distribution in metadata.distributions(path=[target]):

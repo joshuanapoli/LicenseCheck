@@ -147,7 +147,9 @@ uv run licensecheck  --only-licenses mit apache --show-only-failing -g dev
 usage: licensecheck [-h] [--license LICENSE] [--format FORMAT] [--requirements-paths REQUIREMENTS_PATHS [REQUIREMENTS_PATHS ...]]
                     [--groups GROUPS [GROUPS ...]] [--extras EXTRAS [EXTRAS ...]] [--file FILE]
                     [--ignore-packages IGNORE_PACKAGES [IGNORE_PACKAGES ...]] [--fail-packages FAIL_PACKAGES [FAIL_PACKAGES ...]]
-                    [--ignore-licenses IGNORE_LICENSES [IGNORE_LICENSES ...]] [--fail-licenses FAIL_LICENSES [FAIL_LICENSES ...]]
+                    [--ignore-licenses IGNORE_LICENSES [IGNORE_LICENSES ...]]
+                    [--allowed-license-references ALLOWED_LICENSE_REFERENCES [ALLOWED_LICENSE_REFERENCES ...]]
+                    [--fail-licenses FAIL_LICENSES [FAIL_LICENSES ...]]
                     [--only-licenses ONLY_LICENSES [ONLY_LICENSES ...]]
                     [--skip-dependencies SKIP_DEPENDENCIES [SKIP_DEPENDENCIES ...]]
                     [--hide-output-parameters HIDE_OUTPUT_PARAMETERS [HIDE_OUTPUT_PARAMETERS ...]] [--show-only-failing]
@@ -174,6 +176,8 @@ options:
                         List of packages/dependencies to fail (compat=False); names, name==version, and globs are supported
   --ignore-licenses IGNORE_LICENSES [IGNORE_LICENSES ...]
                         List of licenses to ignore (skipped, compat may still be False)
+  --allowed-license-references ALLOWED_LICENSE_REFERENCES [ALLOWED_LICENSE_REFERENCES ...]
+                        List of exact LicenseRef-* identifiers to accept
   --fail-licenses FAIL_LICENSES [FAIL_LICENSES ...]
                         List of licenses to fail (compat=False)
   --only-licenses ONLY_LICENSES [ONLY_LICENSES ...]

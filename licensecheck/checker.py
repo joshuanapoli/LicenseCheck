@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from fnmatch import fnmatch
 
+from loguru import logger
 from packaging.requirements import Requirement
+from packaging.specifiers import SpecifierSet
 from packaging.utils import canonicalize_name
 
 from licensecheck import license_matrix
@@ -25,14 +27,6 @@ def _package_matches(package: PackageInfo, patterns: set[str]) -> bool:
 	)
 
 
-def _matches_custom_license(this_license_text: str | None, dependency_license: str) -> bool:
-	if not this_license_text:
-		return False
-	project_license = this_license_text.strip().casefold()
-	dependency_license = dependency_license.strip().casefold()
-	return project_license.startswith("licenseref-") and project_license == dependency_license
-
-
 def _matches_allowed_license_reference(
 	allowed_license_references: set[str], dependency_license: str
 ) -> bool:
@@ -42,15 +36,35 @@ def _matches_allowed_license_reference(
 	}
 
 
-def _license_override(package: PackageInfo, license_overrides: dict[str, str]) -> str | None:
-	if package.version is None:
-		return None
+def _parse_license_overrides(
+	license_overrides: dict[str, str],
+) -> list[tuple[str, SpecifierSet, str]]:
+	"""Parse the configured overrides once, rather than once per package."""
+	parsed: list[tuple[str, SpecifierSet, str]] = []
 	for package_requirement, license_value in license_overrides.items():
 		requirement = Requirement(package_requirement)
-		if canonicalize_name(requirement.name) == canonicalize_name(
-			package.name
-		) and requirement.specifier.contains(package.version, prereleases=True):
-			return license_value.strip()
+		if not requirement.specifier:
+			# An unversioned override would silently apply to every version of the package.
+			logger.warning(
+				f"Ignoring license override '{package_requirement}': "
+				f"an exact name==version is required"
+			)
+			continue
+		parsed.append(
+			(canonicalize_name(requirement.name), requirement.specifier, license_value.strip())
+		)
+	return parsed
+
+
+def _license_override(
+	package: PackageInfo, license_overrides: list[tuple[str, SpecifierSet, str]]
+) -> str | None:
+	if package.version is None:
+		return None
+	package_name = canonicalize_name(package.name)
+	for name, specifier, license_value in license_overrides:
+		if name == package_name and specifier.contains(package.version, prereleases=True):
+			return license_value
 	return None
 
 
@@ -60,6 +74,7 @@ def check(
 	extras: set[str],
 	this_license: License,
 	package_info_manager: PackageInfoManager,
+	*,
 	this_license_text: str | None = None,
 	ignore_packages: set[str] | None = None,
 	license_overrides: dict[str, str] | None = None,
@@ -72,10 +87,13 @@ def check(
 ) -> tuple[bool, set[PackageInfo]]:
 	# Def values
 	ignore_packages = ignore_packages or set()
-	license_overrides = license_overrides or {}
+	parsed_license_overrides = _parse_license_overrides(license_overrides or {})
 	fail_packages = fail_packages or set()
 	ignore_licenses = ignore_licenses or set()
-	allowed_license_references = allowed_license_references or set()
+	# The project's own license reference is always an accepted reference
+	allowed_license_references = (allowed_license_references or set()) | (
+		{this_license_text} if this_license_text else set()
+	)
 	fail_licenses = fail_licenses or set()
 	only_licenses = only_licenses or set()
 	skip_dependencies = skip_dependencies or set()
@@ -99,7 +117,7 @@ def check(
 	# Check it is compatible with packages and add a note
 	packages = package_info_manager.getPackages()
 	for package in packages:
-		if override := _license_override(package, license_overrides):
+		if override := _license_override(package, parsed_license_overrides):
 			package.license = override
 			package.licenseSource = "configured override"
 		# Deal with --ignore-packages and --fail-packages
@@ -111,8 +129,6 @@ def check(
 		elif license_matrix.licenseType(str(package.license), ignore_licenses) & failLicensesType:
 			pass
 		elif _matches_allowed_license_reference(allowed_license_references, str(package.license)):
-			package.licenseCompat = True
-		elif _matches_custom_license(this_license_text, str(package.license)):
 			package.licenseCompat = True
 		# Else get compat with myLice
 		else:
