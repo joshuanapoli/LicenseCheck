@@ -187,3 +187,63 @@ def test_allowed_license_references_match_exact_raw_references(
 	)
 
 	assert incompatible == expected_incompatible, packages
+
+
+@pytest.mark.parametrize(
+	("override_package", "expected_incompatible", "expected_license_source"),
+	[
+		("private-package==1.2.3", False, "configured override"),
+		("PRIVATE_package==1.2.3", False, "configured override"),
+		("private-package==1.2.4", True, None),
+	],
+)
+def test_license_overrides_apply_only_to_exact_versions(
+	mock_package_info_manager: PackageInfoManager,
+	override_package: str,
+	*,
+	expected_incompatible: bool,
+	expected_license_source: str | None,
+) -> None:
+	mock_package_info_manager.getPackages.return_value = {
+		PackageInfo(
+			name="private-package",
+			version="1.2.3",
+			license="Other/Proprietary License",
+		)
+	}
+
+	incompatible, packages = check(
+		requirements_paths={"requirements.txt"},
+		groups=set(),
+		extras=set(),
+		this_license=License.MIT,
+		package_info_manager=mock_package_info_manager,
+		license_overrides={override_package: "BSD-3-Clause"},
+	)
+	package = packages.pop()
+
+	assert incompatible == expected_incompatible
+	assert package.license == (
+		"BSD-3-Clause" if expected_license_source else "Other/Proprietary License"
+	)
+	assert package.licenseSource == expected_license_source
+
+
+def test_license_overrides_still_obey_license_deny_rules(
+	mock_package_info_manager: PackageInfoManager,
+) -> None:
+	mock_package_info_manager.getPackages.return_value = {
+		PackageInfo(name="private-package", version="1.2.3", license="MIT")
+	}
+
+	incompatible, packages = check(
+		requirements_paths={"requirements.txt"},
+		groups=set(),
+		extras=set(),
+		this_license=License.MIT,
+		package_info_manager=mock_package_info_manager,
+		license_overrides={"private-package==1.2.3": "GPL-3.0"},
+		fail_licenses={"GPL-3.0"},
+	)
+
+	assert incompatible, packages

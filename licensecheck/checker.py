@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from fnmatch import fnmatch
 
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
+
 from licensecheck import license_matrix
 from licensecheck.models.constants import JOINS
 from licensecheck.models.license import License
@@ -39,6 +42,18 @@ def _matches_allowed_license_reference(
 	}
 
 
+def _license_override(package: PackageInfo, license_overrides: dict[str, str]) -> str | None:
+	if package.version is None:
+		return None
+	for package_requirement, license_value in license_overrides.items():
+		requirement = Requirement(package_requirement)
+		if canonicalize_name(requirement.name) == canonicalize_name(
+			package.name
+		) and requirement.specifier.contains(package.version, prereleases=True):
+			return license_value.strip()
+	return None
+
+
 def check(
 	requirements_paths: set[str],
 	groups: set[str],
@@ -47,6 +62,7 @@ def check(
 	package_info_manager: PackageInfoManager,
 	this_license_text: str | None = None,
 	ignore_packages: set[str] | None = None,
+	license_overrides: dict[str, str] | None = None,
 	fail_packages: set[str] | None = None,
 	ignore_licenses: set[str] | None = None,
 	allowed_license_references: set[str] | None = None,
@@ -56,6 +72,7 @@ def check(
 ) -> tuple[bool, set[PackageInfo]]:
 	# Def values
 	ignore_packages = ignore_packages or set()
+	license_overrides = license_overrides or {}
 	fail_packages = fail_packages or set()
 	ignore_licenses = ignore_licenses or set()
 	allowed_license_references = allowed_license_references or set()
@@ -82,6 +99,9 @@ def check(
 	# Check it is compatible with packages and add a note
 	packages = package_info_manager.getPackages()
 	for package in packages:
+		if override := _license_override(package, license_overrides):
+			package.license = override
+			package.licenseSource = "configured override"
 		# Deal with --ignore-packages and --fail-packages
 		package.licenseCompat = False
 		if _package_matches(package, ignore_packages):

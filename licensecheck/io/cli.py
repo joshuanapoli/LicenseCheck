@@ -178,6 +178,7 @@ def main(licensecheckConf: LC_Config) -> ExitCode:
 		this_license_text=this_license_text,
 		package_info_manager=package_info_manager,
 		ignore_packages=licensecheckConf.ignore_packages,
+		license_overrides=licensecheckConf.license_overrides,
 		fail_packages=licensecheckConf.fail_packages,
 		ignore_licenses=licensecheckConf.ignore_licenses,
 		allowed_license_references=licensecheckConf.allowed_license_references,

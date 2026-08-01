@@ -106,6 +106,7 @@ groups = []                   # List of selected groups
 extras = []                   # List of selected extras
 file = ""                     # Output file (leave empty for stdout)
 ignore_packages = []          # Packages/dependencies to ignore
+license_overrides = {}        # Reviewed licenses for exact package versions
 fail_packages = []            # Packages/dependencies that cause failure
 ignore_licenses = []          # Licenses to ignore
 allowed_license_references = [] # Exact LicenseRef identifiers to accept

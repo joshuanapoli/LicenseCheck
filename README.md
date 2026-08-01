@@ -211,6 +211,7 @@ groups = []                   # List of selected groups
 extras = []                   # List of selected extras
 file = ""                     # Output file (leave empty for stdout)
 ignore_packages = []          # Names, name==version entries, or globs to ignore
+license_overrides = { "sample==1.2.3" = "BSD-3-Clause" } # Reviewed licenses for exact versions
 fail_packages = []            # Names, name==version entries, or globs that fail
 ignore_licenses = []          # Licenses to ignore
 allowed_license_references = [] # Exact LicenseRef identifiers to accept
@@ -240,6 +241,7 @@ zero = false                  # Return non-zero exit code for incompatible licen
       "ignore_licenses": [],
       "allowed_license_references": [],
       "ignore_packages": [],
+      "license_overrides": {"sample==1.2.3": "BSD-3-Clause"},
       "license": "mit",
       "only_licenses": [],
       "pypi_api": "https://pypi.org",
