@@ -52,8 +52,7 @@ THISDIR = Path(__file__).resolve().parent
 with Path(THISDIR / "matrix.csv").open(mode="r", newline="", encoding="utf-8") as csv_file:
 	LICENSE_MATRIX: list[list[str]] = list[list[str]](csv.reader(csv_file))
 
-# Look the matrix up by license name. The csv column/row order does not match the
-# declaration order of the License enum, so positional indexing silently misreads rows.
+# Look the matrix up by license name because the csv column/row order does not match.
 LICENSE_MATRIX_ROWS: dict[str, list[str]] = {row[0]: row for row in LICENSE_MATRIX[1:]}
 LICENSE_MATRIX_COLUMNS: dict[str, int] = {
 	name: index for index, name in enumerate(LICENSE_MATRIX[0])
