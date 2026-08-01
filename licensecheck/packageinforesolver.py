@@ -37,6 +37,10 @@ from licensecheck.session import session
 RAW_JOINS = " AND "
 HTTP_OK = 200
 
+EXPLICIT_LICENSE_ALIASES = {
+	"Apache 2.0": "Apache-2.0",
+}
+
 
 class UvUnavailableError(RuntimeError):
 	"""Raised when the optional uv executable is unavailable."""
@@ -65,6 +69,35 @@ def _has_usable_license(license_value: str | None) -> bool:
 		license_value
 		and license_value.strip()
 		and license_value.strip().upper() not in {UNKNOWN, "NONE"}
+	)
+
+
+def _recognizable_explicit_license(license_value: str | None) -> str | None:
+	if not _has_usable_license(license_value):
+		return None
+
+	value = str(license_value).strip()
+	if re.fullmatch(r"LicenseRef-[A-Za-z0-9.-]+", value):
+		return value
+	if value in EXPLICIT_LICENSE_ALIASES:
+		return EXPLICIT_LICENSE_ALIASES[value]
+
+	with contextlib.suppress(license_expression.ExpressionError):
+		license_expression.get_spdx_licensing().parse(value, validate=True)
+		return value
+	return None
+
+
+def _license_from_metadata(
+	license_expression_value: str | None,
+	classifiers: list[str] | None,
+	legacy_license: str | None,
+) -> str | None:
+	return (
+		license_expression_value
+		or _recognizable_explicit_license(legacy_license)
+		or from_classifiers(classifiers)
+		or legacy_license
 	)
 
 
@@ -819,10 +852,10 @@ class LocalPackageInfo:
 			self.meta = metadata.metadata(package.name)
 
 	def get_license(self) -> str | None:
-		return (
-			self.meta.get("License-Expression")
-			or from_classifiers(self.meta.get_all("Classifier"))
-			or self.meta.get("License")
+		return _license_from_metadata(
+			self.meta.get("License-Expression"),
+			self.meta.get_all("Classifier"),
+			self.meta.get("License"),
 		)
 
 	def get_name(self) -> str | None:
@@ -922,10 +955,10 @@ class IndexPackageInfo:
 
 	def get_license(self) -> str | None:
 		self.lazy_fetch()
-		return (
-			self.meta.get("License-Expression")
-			or from_classifiers(self.meta.get_all("Classifier"))
-			or self.meta.get("License")
+		return _license_from_metadata(
+			self.meta.get("License-Expression"),
+			self.meta.get_all("Classifier"),
+			self.meta.get("License"),
 		)
 
 	def get_name(self) -> str | None:
@@ -1006,10 +1039,10 @@ class RemotePackageInfo:
 
 	def get_license(self) -> str:
 		response = self._response()
-		return (
-			response.info.license_expression
-			or from_classifiers(response.info.classifiers)
-			or response.info.license
+		return _license_from_metadata(
+			response.info.license_expression,
+			response.info.classifiers,
+			response.info.license,
 		)
 
 	def get_size(self) -> int | None:

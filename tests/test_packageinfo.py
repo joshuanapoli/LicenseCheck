@@ -14,6 +14,7 @@ from licensecheck.packageinforesolver import (
 	LocalPackageInfo,
 	PackageInfoManager,
 	RemotePackageInfo,
+	_license_from_metadata,
 	from_classifiers,
 	normalize_license,
 )
@@ -64,7 +65,7 @@ def test_getPackageInfoPypi(remote_package_info: RemotePackageInfo) -> None:
 
 	assert pkg.get_name() == "requests"
 	assert pkg.get_author() == "Kenneth Reitz"
-	assert pkg.get_license() == "Apache Software License"
+	assert pkg.get_license() == "Apache-2.0"
 
 
 def test_remote_package_info_uses_versioned_pypi_endpoint(
@@ -510,7 +511,7 @@ def test_getPackages(package_info_manager: PackageInfoManager) -> None:
 	package = packages.pop()
 	assert package.name == "requests"
 	assert package.author == "Kenneth Reitz"
-	assert package.license == "Apache Software License"
+	assert package.license == "Apache-2.0"
 
 
 def test_getPackagesNotFound(package_info_manager: PackageInfoManager) -> None:
@@ -534,6 +535,44 @@ def test_licenseFromEmptyClassifierlist() -> None:
 	licenses = []
 	licenses.append(from_classifiers([]))
 	assert licenses == [None]
+
+
+@pytest.mark.parametrize(
+	("license_expression", "classifier", "legacy_license", "expected"),
+	[
+		(
+			"MIT",
+			"License :: Other/Proprietary License",
+			"LicenseRef-Example-Proprietary",
+			"MIT",
+		),
+		(
+			None,
+			"License :: Other/Proprietary License",
+			"LicenseRef-Example-Proprietary",
+			"LicenseRef-Example-Proprietary",
+		),
+		(
+			None,
+			"License :: Other/Proprietary License",
+			"Apache 2.0",
+			"Apache-2.0",
+		),
+		(
+			None,
+			"License :: OSI Approved :: MIT License",
+			"unrecognized license text",
+			"MIT License",
+		),
+	],
+)
+def test_explicit_license_metadata_precedes_classifiers_when_recognizable(
+	license_expression: str | None,
+	classifier: str,
+	legacy_license: str,
+	expected: str,
+) -> None:
+	assert _license_from_metadata(license_expression, [classifier], legacy_license) == expected
 
 
 def test_getModuleSize() -> None:
